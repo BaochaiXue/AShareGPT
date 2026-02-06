@@ -22,6 +22,14 @@ python run_cn_train.py
 python run_cn_backtest.py --strategy best_cn_strategy.json
 ```
 
+## Migration (v0.6.0)
+- `model_core.infrastructure.legacy` has been removed.
+- If you imported trainer compatibility directly, use:
+  - `from model_core.infrastructure.adapters import LegacyAlphaTrainer`
+- CLI entry points are unchanged:
+  - `python run_cn_train.py`
+  - `python run_cn_backtest.py ...`
+
 ## Environment Variables
 See `.env.example` for settings (signal minute, exit minute, date filters).
 
