@@ -123,7 +123,7 @@ class FeatureEngineer:
         # looping over assets is safer for correctness with pandas_ta's structure.
         
         CustomStrategy = ta.Strategy(
-            name="AlphaGPT Strategy",
+            name="NeuralSymbolicAlphaGenerator Strategy",
             ta=[
                 # Returns
                 {"kind": "log_return", "cumulative": False},

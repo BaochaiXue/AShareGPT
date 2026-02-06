@@ -4,7 +4,11 @@ from typing import Any, Optional
 
 import torch
 
-from model_core.alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
+from model_core.neural_symbolic_alpha_generator import (
+    NeuralSymbolicAlphaGenerator,
+    NewtonSchulzLowRankDecay,
+    StableRankMonitor,
+)
 from model_core.application.services import TrainingWorkflowService, build_token_tables
 from model_core.backtest import ChinaBacktest
 from model_core.config import ModelConfig
@@ -30,7 +34,7 @@ def create_training_workflow_service_from_components(
     lord_decay_rate: float = 1e-3,
     lord_num_iterations: int = 5,
     loader: Optional[ChinaMinuteDataLoader] = None,
-    model: Optional[AlphaGPT] = None,
+    model: Optional[NeuralSymbolicAlphaGenerator] = None,
     optimizer=None,
     vm: Optional[StackVM] = None,
     backtest: Optional[ChinaBacktest] = None,
@@ -45,7 +49,7 @@ def create_training_workflow_service_from_components(
     if loader.dates is None:
         raise ValueError("Data not loaded. Provide a loaded loader or enable auto_load_data.")
 
-    model = model or AlphaGPT().to(ModelConfig.DEVICE)
+    model = model or NeuralSymbolicAlphaGenerator().to(ModelConfig.DEVICE)
     optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=1e-3)
     vm = vm or StackVM()
     backtest = backtest or ChinaBacktest()

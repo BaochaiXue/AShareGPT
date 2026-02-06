@@ -252,9 +252,9 @@ class LoopedTransformer(nn.Module):
         return x
 
 
-class AlphaGPT(nn.Module):
+class NeuralSymbolicAlphaGenerator(nn.Module):
     """
-    AlphaGPT: Symbolic Formula Generative Model.
+    NeuralSymbolicAlphaGenerator: Symbolic Formula Generative Model.
     
     A specialized Transformer designed to generate Reverse Polish Notation (RPN) formulas
     for quantitative trading. It treats formula generation as a sequence generation task.

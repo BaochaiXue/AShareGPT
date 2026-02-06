@@ -31,6 +31,14 @@ class ModelConfig:
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
     CN_EXIT_TIME = os.getenv("CN_EXIT_TIME", "15:00")
+    # Bar/return semantics:
+    # - CN_BAR_STYLE=daily         -> full-session OHLCV bars.
+    # - CN_BAR_STYLE=signal_snapshot -> legacy single-minute snapshot bars.
+    CN_BAR_STYLE = os.getenv("CN_BAR_STYLE", "daily").strip().lower()
+    # - CN_TARGET_RET_MODE=close_to_close -> close[t]/close[t-hold_days]-1 (T+1-friendly by default).
+    # - CN_TARGET_RET_MODE=signal_to_exit -> legacy same-day signal_time->exit_time return.
+    CN_TARGET_RET_MODE = os.getenv("CN_TARGET_RET_MODE", "close_to_close").strip().lower()
+    CN_HOLD_DAYS = int(os.getenv("CN_HOLD_DAYS", "1"))
     CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))

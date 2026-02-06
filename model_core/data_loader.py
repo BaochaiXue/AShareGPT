@@ -32,7 +32,9 @@ class WalkForwardFold:
 class ChinaMinuteDataLoader:
     """
     Minute-level data loader for China A-share/ETF.
-    Builds daily decision tensors from minute bars, then holds to exit minute.
+    Builds decision tensors from minute bars with configurable:
+    - bar semantics (`daily` vs `signal_snapshot`)
+    - return semantics (`close_to_close` vs `signal_to_exit`)
     """
 
     def __init__(self, data_root: Optional[str] = None):
@@ -60,6 +62,32 @@ class ChinaMinuteDataLoader:
                 return datetime.strptime(value, "%H:%M:%S").time()
             except ValueError:
                 return None
+
+    @staticmethod
+    def _resolve_bar_style() -> str:
+        style = ModelConfig.CN_BAR_STYLE.strip().lower()
+        if style not in {"daily", "signal_snapshot"}:
+            raise ValueError(
+                f"Unsupported CN_BAR_STYLE={ModelConfig.CN_BAR_STYLE!r}; "
+                "expected 'daily' or 'signal_snapshot'."
+            )
+        return style
+
+    @staticmethod
+    def _resolve_target_ret_mode() -> tuple[str, int]:
+        mode = ModelConfig.CN_TARGET_RET_MODE.strip().lower()
+        if mode not in {"close_to_close", "signal_to_exit"}:
+            raise ValueError(
+                f"Unsupported CN_TARGET_RET_MODE={ModelConfig.CN_TARGET_RET_MODE!r}; "
+                "expected 'close_to_close' or 'signal_to_exit'."
+            )
+        if mode == "signal_to_exit":
+            return mode, 0
+
+        hold_days = int(ModelConfig.CN_HOLD_DAYS)
+        if hold_days < 1:
+            raise ValueError("CN_HOLD_DAYS must be >= 1 when CN_TARGET_RET_MODE='close_to_close'.")
+        return mode, hold_days
 
     def _is_date_only_literal(self, value: str) -> bool:
         """Return True when value is a date-only literal without clock time."""
@@ -356,6 +384,8 @@ class ChinaMinuteDataLoader:
         end_dt_exclusive: Optional[pd.Timestamp],
         sig_time: time,
         exit_t: Optional[time],
+        bar_style: str,
+        target_ret_mode: str,
     ) -> list[dict[str, float | pd.Timestamp]]:
         records: list[dict[str, float | pd.Timestamp]] = []
         for year in years:
@@ -394,13 +424,18 @@ class ChinaMinuteDataLoader:
                 else:
                     exit_row = day_frame.iloc[-1]
 
-                entry_open = float(entry_row["open"])
-                exit_close = float(exit_row["close"])
-                if entry_open == 0:
-                    continue
-
-                records.append(
-                    {
+                if bar_style == "daily":
+                    rec = {
+                        "date": date,
+                        "open": float(day_frame.iloc[0]["open"]),
+                        "high": float(day_frame["high"].max()),
+                        "low": float(day_frame["low"].min()),
+                        "close": float(day_frame.iloc[-1]["close"]),
+                        "volume": float(day_frame["vol"].sum()),
+                        "amount": float(day_frame["amount"].sum()),
+                    }
+                else:
+                    rec = {
                         "date": date,
                         "open": float(entry_row["open"]),
                         "high": float(entry_row["high"]),
@@ -408,9 +443,16 @@ class ChinaMinuteDataLoader:
                         "close": float(entry_row["close"]),
                         "volume": float(entry_row["vol"]),
                         "amount": float(entry_row["amount"]),
-                        "target_ret": (exit_close / entry_open) - 1.0,
                     }
-                )
+
+                if target_ret_mode == "signal_to_exit":
+                    entry_open = float(entry_row["open"])
+                    exit_close = float(exit_row["close"])
+                    if entry_open == 0:
+                        continue
+                    rec["target_ret"] = (exit_close / entry_open) - 1.0
+
+                records.append(rec)
         return records
 
     def _build_per_code_frames(
@@ -423,6 +465,9 @@ class ChinaMinuteDataLoader:
         end_dt_exclusive: Optional[pd.Timestamp],
         sig_time: time,
         exit_t: Optional[time],
+        bar_style: str,
+        target_ret_mode: str,
+        hold_days: int,
     ) -> dict[str, pd.DataFrame]:
         per_code_frames: dict[str, pd.DataFrame] = {}
         for code in codes:
@@ -434,6 +479,8 @@ class ChinaMinuteDataLoader:
                 end_dt_exclusive=end_dt_exclusive,
                 sig_time=sig_time,
                 exit_t=exit_t,
+                bar_style=bar_style,
+                target_ret_mode=target_ret_mode,
             )
             if not records:
                 continue
@@ -441,6 +488,8 @@ class ChinaMinuteDataLoader:
             frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
+            if target_ret_mode == "close_to_close":
+                frame["target_ret"] = (frame["close"] / frame["close"].shift(hold_days)) - 1.0
             per_code_frames[code] = frame
         return per_code_frames
 
@@ -552,6 +601,8 @@ class ChinaMinuteDataLoader:
 
         sig_time = self._parse_time(signal_time or ModelConfig.CN_SIGNAL_TIME) or time(10, 0)
         exit_t = self._parse_time(exit_time or ModelConfig.CN_EXIT_TIME)
+        bar_style = self._resolve_bar_style()
+        target_ret_mode, hold_days = self._resolve_target_ret_mode()
         start_dt, end_dt, end_dt_exclusive = self._resolve_time_bounds(start_date, end_date)
         per_code_frames = self._build_per_code_frames(
             codes=codes,
@@ -561,6 +612,9 @@ class ChinaMinuteDataLoader:
             end_dt_exclusive=end_dt_exclusive,
             sig_time=sig_time,
             exit_t=exit_t,
+            bar_style=bar_style,
+            target_ret_mode=target_ret_mode,
+            hold_days=hold_days,
         )
 
         if not per_code_frames:
@@ -591,6 +645,14 @@ class ChinaMinuteDataLoader:
         self.symbols = list(columns)
 
         print(f"CN Minute Data Ready. Shape: {self.feat_tensor.shape}")
+        if target_ret_mode == "close_to_close":
+            print(f"[ret] mode=close_to_close hold_days={hold_days}")
+        else:
+            print(
+                f"[ret] mode=signal_to_exit signal_time={sig_time.strftime('%H:%M:%S')} "
+                f"exit_time={(exit_t.strftime('%H:%M:%S') if exit_t else 'eod')}"
+            )
+        print(f"[bar] style={bar_style}")
         if self.feature_norm_info:
             print(
                 "[norm] mode={mode} fit_len={fit_len} clip={clip}".format(
