@@ -137,7 +137,7 @@ class BacktestFormulaUseCase:
                     return_details=return_details,
                 )
                 fold_out["val"] = val_result
-                val_scores.append(float(val_result.score.item()))
+                val_scores.append(float(val_result.score))
             if fold.test.end_idx > fold.test.start_idx:
                 res_test = factors[:, fold.test.start_idx : fold.test.end_idx]
                 test_result = self._backtest_engine.evaluate(
@@ -147,7 +147,7 @@ class BacktestFormulaUseCase:
                     return_details=return_details,
                 )
                 fold_out["test"] = test_result
-                test_scores.append(float(test_result.score.item()))
+                test_scores.append(float(test_result.score))
             if "val" in fold_out or "test" in fold_out:
                 fold_results.append(fold_out)
 

@@ -50,3 +50,13 @@ class TrainingArtifact:
     best_score: float
     strategy_path: Optional[str] = None
 
+
+@dataclass
+class BacktestEvaluation:
+    """Serializable backtest result returned by application ports."""
+
+    score: float
+    mean_return: float
+    metrics: Optional[dict[str, float]] = None
+    equity_curve: Optional[list[float]] = None
+    portfolio_returns: Optional[list[float]] = None

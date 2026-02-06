@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from model_core.application.use_cases import BacktestFormulaUseCase, TrainAlphaUseCase
-from model_core.infrastructure.legacy import (
-    LegacyAlphaTrainer,
-    LegacyBacktestEngine,
-    LegacyChinaDataGateway,
-    LegacyStackVmExecutor,
+from model_core.infrastructure import (
+    ChinaBacktestEngineAdapter,
+    ChinaDataGatewayAdapter,
+    StackVmFormulaExecutorAdapter,
 )
+from model_core.infrastructure.legacy import LegacyAlphaTrainer
 from .factories import create_training_workflow_service
 
 
@@ -20,9 +20,9 @@ class LegacyContainer:
     This keeps old implementations but exposes them through explicit ports.
     """
 
-    data_gateway: LegacyChinaDataGateway
-    formula_executor: LegacyStackVmExecutor
-    backtest_engine: LegacyBacktestEngine
+    data_gateway: ChinaDataGatewayAdapter
+    formula_executor: StackVmFormulaExecutorAdapter
+    backtest_engine: ChinaBacktestEngineAdapter
     trainer: LegacyAlphaTrainer
 
     def backtest_use_case(self) -> BacktestFormulaUseCase:
@@ -43,9 +43,9 @@ def create_legacy_container(
     lord_num_iterations: int = 5,
 ) -> LegacyContainer:
     return LegacyContainer(
-        data_gateway=LegacyChinaDataGateway(),
-        formula_executor=LegacyStackVmExecutor(),
-        backtest_engine=LegacyBacktestEngine(),
+        data_gateway=ChinaDataGatewayAdapter(),
+        formula_executor=StackVmFormulaExecutorAdapter(),
+        backtest_engine=ChinaBacktestEngineAdapter(),
         trainer=LegacyAlphaTrainer(
             use_lord_regularization=use_lord_regularization,
             lord_decay_rate=lord_decay_rate,

@@ -10,8 +10,8 @@ from model_core.data_loader import (
 from model_core.domain.models import DataBundle, DatasetSlice, WalkForwardBundle
 
 
-class LegacyChinaDataGateway:
-    """Adapter from legacy `ChinaMinuteDataLoader` to the data gateway port."""
+class ChinaDataGatewayAdapter:
+    """Adapter from `ChinaMinuteDataLoader` to `DataGatewayPort`."""
 
     def __init__(self, loader: Optional[ChinaMinuteDataLoader] = None):
         self._loader = loader or ChinaMinuteDataLoader()

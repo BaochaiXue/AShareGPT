@@ -5,6 +5,7 @@ from typing import Optional, Protocol
 import torch
 
 from model_core.domain.models import (
+    BacktestEvaluation,
     DataBundle,
     DatasetSlice,
     Formula,
@@ -56,7 +57,7 @@ class BacktestEnginePort(Protocol):
         target_ret: torch.Tensor,
         *,
         return_details: bool = False,
-    ):
+    ) -> BacktestEvaluation:
         ...
 
 

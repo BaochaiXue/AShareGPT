@@ -32,7 +32,7 @@ def print_metrics(title: str, result) -> None:
     print("\n" + "-" * 60)
     print(title)
     print("-" * 60)
-    print(f"Sortino Score: {result.score.item():.4f}")
+    print(f"Sortino Score: {result.score:.4f}")
     print(f"Mean Return: {result.mean_return:.4%}")
     if not result.metrics:
         return
@@ -51,8 +51,8 @@ def save_equity_curve(path: str, dates, result) -> None:
     df = pd.DataFrame(
         {
             "date": dates.astype("datetime64[ns]"),
-            "equity": result.equity_curve.numpy(),
-            "return": result.portfolio_returns.numpy(),
+            "equity": result.equity_curve,
+            "return": result.portfolio_returns,
         }
     )
     df.to_csv(out_path, index=False)
@@ -151,7 +151,7 @@ def run_backtest(
         save_equity_curve(curve_out, dates, result)
 
     return {
-        'score': result.score.item(),
+        'score': result.score,
         'mean_return': result.mean_return,
         'avg_turnover': result.metrics["avg_turnover"] if result.metrics else 0.0,
     }
