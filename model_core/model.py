@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import ModelConfig
 from .factors import FeatureEngineer
-from .ops import OPS_CONFIG
+from .ops import get_ops_config
 
 
 class NewtonSchulzLowRankDecay:
@@ -263,7 +263,7 @@ class NeuralSymbolicAlphaGenerator(nn.Module):
         super().__init__()
         self.d_model = 64
         self.features_list = FeatureEngineer.FEATURES
-        self.ops_list = [cfg[0] for cfg in OPS_CONFIG]
+        self.ops_list = [cfg[0] for cfg in get_ops_config()]
         
         self.vocab = self.features_list + self.ops_list
         self.bos_id = len(self.vocab)

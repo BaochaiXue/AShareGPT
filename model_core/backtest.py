@@ -190,6 +190,13 @@ class ChinaBacktest:
                 "raw_data['session_id'] must match signal shape [assets, time]."
             )
 
+        # Price-limit masks
+        limit_up = None
+        limit_down = None
+        if raw_data is not None:
+            limit_up = raw_data.get("limit_up")
+            limit_down = raw_data.get("limit_down")
+
         if t_plus_one_required is None and sell_block is not None:
             per_asset_required = (sell_block.max(dim=1, keepdim=True).values > 0).float()
             t_plus_one_required = per_asset_required.expand_as(desired_position)
@@ -220,6 +227,19 @@ class ChinaBacktest:
             min_allowed = locked_buy
             reduce_long = desired_t < min_allowed
             desired_t = torch.where(blocked_t & reduce_long, min_allowed, desired_t)
+
+            # --- Price-limit enforcement ---
+            # 涨停: cannot buy (increase long position)
+            if limit_up is not None:
+                up_hit = limit_up[:, t] > 0
+                buy_increase = desired_t > prev_pos
+                desired_t = torch.where(up_hit & buy_increase, prev_pos, desired_t)
+
+            # 跌停: cannot sell (decrease long position)
+            if limit_down is not None:
+                dn_hit = limit_down[:, t] > 0
+                sell_decrease = desired_t < prev_pos
+                desired_t = torch.where(dn_hit & sell_decrease, prev_pos, desired_t)
 
             current_pos = torch.where(tradable_t, desired_t, prev_pos)
 

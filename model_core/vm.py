@@ -1,6 +1,6 @@
 from typing import Optional, Callable
 import torch
-from .ops import OPS_CONFIG
+from .ops import get_ops_config
 from .factors import FeatureEngineer
 
 
@@ -17,13 +17,13 @@ class StackVM:
         # Feature indices are [0, INPUT_DIM - 1]
         self.feat_offset = FeatureEngineer.INPUT_DIM
         
-        # Build lookup tables for operators
-        # Token ID = Offset + Index in OPS_CONFIG
+        # Build lookup tables for operators (frequency-adaptive)
+        ops_config = get_ops_config()
         self.op_map: dict[int, Callable[..., torch.Tensor]] = {
-            i + self.feat_offset: cfg[1] for i, cfg in enumerate(OPS_CONFIG)
+            i + self.feat_offset: cfg[1] for i, cfg in enumerate(ops_config)
         }
         self.arity_map: dict[int, int] = {
-            i + self.feat_offset: cfg[2] for i, cfg in enumerate(OPS_CONFIG)
+            i + self.feat_offset: cfg[2] for i, cfg in enumerate(ops_config)
         }
 
     def execute(self, formula_tokens: list[int], feat_tensor: torch.Tensor) -> Optional[torch.Tensor]:

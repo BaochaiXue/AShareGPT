@@ -3,3 +3,5 @@ torch
 tqdm
 numpy
 scipy
+pandas_ta
+python-dotenv

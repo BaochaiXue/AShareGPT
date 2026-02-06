@@ -6,26 +6,28 @@ Usage:
     python run_cn_backtest.py --strategy best_cn_strategy.json
     python run_cn_backtest.py --symbols 000001.SZ,600519.SH
 """
-
+import json
 import os
 import sys
-import json
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 from model_core.config import ModelConfig
-from model_core.entrypoints import create_backtest_use_case
+from model_core.data_loader import ChinaMinuteDataLoader
+from model_core.backtest import ChinaBacktest
+from model_core.vm import StackVM
 
 
 def load_strategy(filepath: str) -> list:
-    with open(filepath, 'r') as f:
+    with open(filepath, "r") as f:
         return json.load(f)
 
 
-def _format_pct(value: float) -> str:
-    return f"{value:.2%}"
+def _fmt(v: float) -> str:
+    return f"{v:.2%}"
 
 
 def print_metrics(title: str, result) -> None:
@@ -37,134 +39,119 @@ def print_metrics(title: str, result) -> None:
     if not result.metrics:
         return
     m = result.metrics
-    print(f"CAGR: {_format_pct(m['cagr'])} | Annual Vol: {_format_pct(m['annual_vol'])} | Sharpe: {m['sharpe']:.2f}")
-    print(f"Max Drawdown: {_format_pct(m['max_drawdown'])} | Calmar: {m['calmar']:.2f} | Win Rate: {_format_pct(m['win_rate'])}")
-    print(f"Profit Factor: {m['profit_factor']:.2f} | Expectancy: {_format_pct(m['expectancy'])}")
-    print(f"Avg Turnover: {_format_pct(m['avg_turnover'])} | Long: {_format_pct(m['long_ratio'])} | Short: {_format_pct(m['short_ratio'])} | Flat: {_format_pct(m['flat_ratio'])}")
+    print(f"CAGR: {_fmt(m['cagr'])} | Annual Vol: {_fmt(m['annual_vol'])} | Sharpe: {m['sharpe']:.2f}")
+    print(f"Max Drawdown: {_fmt(m['max_drawdown'])} | Calmar: {m['calmar']:.2f} | Win Rate: {_fmt(m['win_rate'])}")
+    print(f"Profit Factor: {m['profit_factor']:.2f} | Expectancy: {_fmt(m['expectancy'])}")
+    print(f"Avg Turnover: {_fmt(m['avg_turnover'])} | Long: {_fmt(m['long_ratio'])} | Short: {_fmt(m['short_ratio'])} | Flat: {_fmt(m['flat_ratio'])}")
 
 
 def save_equity_curve(path: str, dates, result) -> None:
     if result.equity_curve is None or result.portfolio_returns is None:
         return
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(
-        {
-            "date": dates.astype("datetime64[ns]"),
-            "equity": result.equity_curve,
-            "return": result.portfolio_returns,
-        }
-    )
-    df.to_csv(out_path, index=False)
-    print(f"📈 Equity curve saved: {out_path}")
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({
+        "date": dates.astype("datetime64[ns]"),
+        "equity": result.equity_curve.tolist() if hasattr(result.equity_curve, "tolist") else result.equity_curve,
+        "return": result.portfolio_returns.tolist() if hasattr(result.portfolio_returns, "tolist") else result.portfolio_returns,
+    })
+    df.to_csv(out, index=False)
+    print(f"📈 Equity curve saved: {out}")
 
 
 def run_backtest(
     formula: list,
-    symbols: list | None = None,
+    symbols: Optional[list[str]] = None,
     split: bool = False,
     walk_forward: bool = False,
-    curve_out: str | None = None,
+    curve_out: Optional[str] = None,
 ):
     print("Loading minute CSV data...")
-    mode = "walk_forward" if walk_forward else ("split" if split else "full")
-    backtest_use_case, _ = create_backtest_use_case()
-    use_case_result = backtest_use_case.run(
-        formula=formula,
-        mode=mode,
-        symbols=symbols,
+    loader = ChinaMinuteDataLoader()
+    loader.load_data(
+        codes=symbols or ModelConfig.CN_CODES or None,
+        years=ModelConfig.CN_MINUTE_YEARS or None,
+        start_date=ModelConfig.CN_MINUTE_START_DATE,
+        end_date=ModelConfig.CN_MINUTE_END_DATE,
+        signal_time=ModelConfig.CN_SIGNAL_TIME,
+        exit_time=ModelConfig.CN_EXIT_TIME,
         limit_codes=ModelConfig.CN_MAX_CODES,
-        return_details=True,
     )
-    if not use_case_result.ok:
-        print(f"❌ {use_case_result.message}")
-        return None
 
-    payload = use_case_result.payload or {}
-    dates = payload.get("dates")
-    symbols_loaded = payload.get("symbols") or []
-    feat_shape = payload.get("feat_shape")
-    warnings = payload.get("warnings") or []
+    vm = StackVM()
+    bt = ChinaBacktest()
 
-    if dates is None:
-        print("❌ Backtest use-case returned incomplete payload")
-        return None
-
-    print(f"Data shape: {feat_shape}")
-    print(f"Symbols: {len(symbols_loaded) if symbols_loaded else 'N/A'}")
-    print(f"Date range: {dates.min()} to {dates.max()}")
+    print(f"Data shape: {loader.feat_tensor.shape}")
+    print(f"Symbols: {len(loader.symbols)}")
+    print(f"Date range: {loader.dates.min()} to {loader.dates.max()}")
     print("\nExecuting strategy formula...")
-    for warning in warnings:
-        print(f"⚠️  Warning: {warning}")
-    print("\nRunning backtest...")
 
-    if mode == "walk_forward":
-        folds = payload.get("folds") or []
+    factors = vm.execute(formula, loader.feat_tensor)
+    if factors is None:
+        print("❌ Invalid formula - execution failed.")
+        return None
+
+    import torch
+    if torch.std(factors) < 1e-4:
+        print("⚠️  Warning: Factor has near-zero variance (trivial formula).")
+
+    print("Running backtest...\n")
+
+    if walk_forward:
+        folds = loader.walk_forward_splits()
         if not folds:
-            print(f"⚠️  {use_case_result.message}")
+            print("⚠️  Walk-forward disabled: not enough data.")
             return None
-        for fold in folds:
-            idx = fold.get("index")
-            val_result = fold.get("val")
-            test_result = fold.get("test")
-            if val_result is not None:
-                print_metrics(f"Fold {idx} - Validation", val_result)
-            if test_result is not None:
-                print_metrics(f"Fold {idx} - Test", test_result)
-        avg_val_score = payload.get("avg_val_score")
-        avg_test_score = payload.get("avg_test_score")
-        if avg_val_score is not None:
-            print(f"\nWalk-forward Avg Val Score: {avg_val_score:.4f}")
-        if avg_test_score is not None:
-            print(f"Walk-forward Avg Test Score: {avg_test_score:.4f}")
+        v_scores, t_scores = [], []
+        for i, fold in enumerate(folds, 1):
+            for label, sl in [("Val", fold.val), ("Test", fold.test)]:
+                if sl.end_idx <= sl.start_idx:
+                    continue
+                sig = factors[:, sl.start_idx:sl.end_idx]
+                r = bt.evaluate(sig, sl.raw_data_cache, sl.target_ret, return_details=True)
+                print_metrics(f"Fold {i} - {label}", r)
+                (v_scores if label == "Val" else t_scores).append(float(r.score.item()))
+        if v_scores:
+            print(f"\nAvg Val Score: {sum(v_scores)/len(v_scores):.4f}")
+        if t_scores:
+            print(f"Avg Test Score: {sum(t_scores)/len(t_scores):.4f}")
         return None
 
-    if mode == "split":
-        split_results = payload.get("splits") or {}
+    if split:
+        splits = loader.train_val_test_split()
         for name in ("train", "val", "test"):
-            out = split_results.get(name)
-            if not out:
+            sl = splits.get(name)
+            if sl is None or sl.end_idx <= sl.start_idx:
                 continue
-            result = out.get("result")
-            split_dates = out.get("dates")
-            if result is None or split_dates is None:
-                continue
-            print_metrics(f"{name.capitalize()} Results", result)
+            sig = factors[:, sl.start_idx:sl.end_idx]
+            r = bt.evaluate(sig, sl.raw_data_cache, sl.target_ret, return_details=True)
+            print_metrics(f"{name.capitalize()} Results", r)
             if curve_out:
-                suffix = f"_{name}"
                 out_path = Path(curve_out)
-                out_file = out_path.with_name(f"{out_path.stem}{suffix}{out_path.suffix or '.csv'}")
-                save_equity_curve(str(out_file), split_dates, result)
+                save_equity_curve(str(out_path.with_name(f"{out_path.stem}_{name}{out_path.suffix or '.csv'}")),
+                                  sl.dates, r)
         return None
 
-    result = payload.get("result")
-    if result is None:
-        print("❌ Backtest use-case returned no full-sample result")
-        return None
-
-    print("\n" + "=" * 60)
+    # Full sample
+    r = bt.evaluate(factors, loader.raw_data_cache, loader.target_ret, return_details=True)
+    print("=" * 60)
     print("📊 Backtest Results")
     print("=" * 60)
-    print_metrics("Full Sample", result)
-
+    print_metrics("Full Sample", r)
     if curve_out:
-        save_equity_curve(curve_out, dates, result)
-
-    return {
-        'score': result.score,
-        'mean_return': result.mean_return,
-        'avg_turnover': result.metrics["avg_turnover"] if result.metrics else 0.0,
-    }
+        save_equity_curve(curve_out, loader.dates, r)
+    return {"score": float(r.score.item()), "mean_return": r.mean_return,
+            "avg_turnover": r.metrics["avg_turnover"] if r.metrics else 0.0}
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run A-share minute backtest")
-    parser.add_argument("--strategy", type=str, default=None, help="Path to strategy JSON file")
-    parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols")
-    parser.add_argument("--formula", type=str, default=None, help="Formula as JSON string")
-    parser.add_argument("--split", action="store_true", help="Report train/val/test metrics")
-    parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward validation")
-    parser.add_argument("--curve-out", type=str, default=None, help="Save equity curve CSV")
+    parser.add_argument("--strategy", type=str, default=None)
+    parser.add_argument("--symbols", type=str, default=None)
+    parser.add_argument("--formula", type=str, default=None)
+    parser.add_argument("--split", action="store_true")
+    parser.add_argument("--walk-forward", action="store_true")
+    parser.add_argument("--curve-out", type=str, default=None)
     args = parser.parse_args()
 
     print("=" * 60)
@@ -175,30 +162,21 @@ def main():
         formula = json.loads(args.formula)
     elif args.strategy:
         formula = load_strategy(args.strategy)
+    elif os.path.exists(ModelConfig.STRATEGY_FILE):
+        formula = load_strategy(ModelConfig.STRATEGY_FILE)
+        print(f"Using strategy file: {ModelConfig.STRATEGY_FILE}")
     else:
-        if os.path.exists(ModelConfig.STRATEGY_FILE):
-            formula = load_strategy(ModelConfig.STRATEGY_FILE)
-            print(f"Using strategy file: {ModelConfig.STRATEGY_FILE}")
-        else:
-            print(f"❌ No strategy file found at {ModelConfig.STRATEGY_FILE}")
-            print("   Train a model first: python run_cn_train.py")
-            sys.exit(1)
+        print(f"❌ No strategy file found at {ModelConfig.STRATEGY_FILE}")
+        sys.exit(1)
 
     print(f"Formula: {formula}")
-
-    symbols = None
-    if args.symbols:
-        symbols = [s.strip() for s in args.symbols.split(',') if s.strip()]
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+    if symbols:
         print(f"Testing on symbols: {symbols}")
 
     try:
-        run_backtest(
-            formula,
-            symbols,
-            split=args.split,
-            walk_forward=args.walk_forward,
-            curve_out=args.curve_out,
-        )
+        run_backtest(formula, symbols, split=args.split,
+                     walk_forward=args.walk_forward, curve_out=args.curve_out)
     except Exception as e:
         print(f"\n❌ Backtest failed: {e}")
         import traceback

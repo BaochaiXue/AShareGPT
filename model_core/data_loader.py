@@ -679,8 +679,6 @@ class ChinaMinuteDataLoader:
             "volume": self._pivot_to_tensor(pivots["volume"], index=index, columns=columns),
             "amount": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
             "tradable": self._pivot_to_tensor(pivots["tradable"], index=index, columns=columns),
-            "liquidity": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
-            "fdv": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
         }
         if "adj_factor" in pivots:
             raw_data_cache["adj_factor"] = self._pivot_to_tensor(
@@ -717,6 +715,14 @@ class ChinaMinuteDataLoader:
         raw_data_cache["session_id"] = session_ids
         raw_data_cache["t_plus_one_required"] = t_plus_one_required
         raw_data_cache["t_plus_one_sell_block"] = t_plus_one_sell_block
+
+        # Price-limit (涨跌停) masks
+        close = raw_data_cache["close"]
+        limit_up, limit_down = rules.build_limit_hit_masks(
+            close=close, symbols=symbols,
+        )
+        raw_data_cache["limit_up"] = limit_up.float()
+        raw_data_cache["limit_down"] = limit_down.float()
 
     def load_data(
         self,

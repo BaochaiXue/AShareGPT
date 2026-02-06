@@ -21,7 +21,12 @@ class ModelConfig:
     SLIPPAGE_IMPACT = float(os.getenv("SLIPPAGE_IMPACT", "0.0"))
     ALLOW_SHORT = os.getenv("ALLOW_SHORT", "0") == "1"
     SIGNAL_LAG = int(os.getenv("CN_SIGNAL_LAG", "1"))
-    ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", "252"))
+    # Annualization: auto-compute for 1min (240 bars/day * 240 trading days)
+    _CN_DECISION_FREQ_RAW = os.getenv("CN_DECISION_FREQ", "daily").strip().lower()
+    _DEFAULT_ANN = "57600" if _CN_DECISION_FREQ_RAW == "1min" else "252"
+    ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", _DEFAULT_ANN))
+    # Price-limit (涨跌停) detection tolerance
+    CN_LIMIT_HIT_TOL = float(os.getenv("CN_LIMIT_HIT_TOL", "0.001"))
     STRATEGY_FILE = os.getenv("STRATEGY_FILE", "best_cn_strategy.json")
     CN_MINUTE_DATA_ROOT = os.getenv("CN_MINUTE_DATA_ROOT", "data")
     CN_USE_ADJ_FACTOR = os.getenv("CN_USE_ADJ_FACTOR", "1") == "1"
@@ -54,6 +59,7 @@ class ModelConfig:
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
     CN_VAL_RATIO = float(os.getenv("CN_VAL_RATIO", "0.0"))
+    CN_TEST_RATIO = float(os.getenv("CN_TEST_RATIO", "0.3"))
     CN_TRAIN_DAYS = int(os.getenv("CN_TRAIN_DAYS", "0"))
     CN_VAL_DAYS = int(os.getenv("CN_VAL_DAYS", "0"))
     CN_TEST_DAYS = int(os.getenv("CN_TEST_DAYS", "0"))
