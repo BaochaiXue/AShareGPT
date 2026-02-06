@@ -16,6 +16,15 @@ class BacktestResult:
     portfolio_returns: Optional[torch.Tensor] = None
 
 
+@dataclass
+class TradingPath:
+    valid: torch.Tensor
+    valid_f: torch.Tensor
+    position: torch.Tensor
+    turnover: torch.Tensor
+    pnl: torch.Tensor
+
+
 class ChinaBacktest:
     """
     Vectorized backtest for China A-share/ETF.
@@ -134,21 +143,7 @@ class ChinaBacktest:
             "flat_ratio": to_float(flat_ratio),
         }
 
-    def evaluate(
-        self,
-        factors: torch.Tensor,
-        raw_data: dict[str, torch.Tensor],
-        target_ret: torch.Tensor,
-        *,
-        return_details: bool = False,
-    ) -> BacktestResult:
-        if factors.numel() == 0:
-            return BacktestResult(score=torch.tensor(-2.0, device=target_ret.device), mean_return=0.0)
-
-        valid = torch.isfinite(target_ret)
-        valid_f = valid.float()
-        signal = torch.tanh(factors)
-
+    def _build_position(self, signal: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
         if self.allow_short:
             position = torch.sign(signal)
         else:
@@ -159,18 +154,57 @@ class ChinaBacktest:
             position[:, : self.signal_lag] = 0.0
 
         # Do not hold positions when target return is missing.
-        position = position * valid_f
+        return position * valid_f
+
+    def _compute_turnover(self, position: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
         # Charge turnover only on bars with realized return; this still costs
         # re-entry after missing-return gaps (valid -> missing -> valid).
-        turnover = turnover * valid_f
+        return turnover * valid_f
 
+    def _compute_pnl(
+        self,
+        *,
+        position: torch.Tensor,
+        turnover: torch.Tensor,
+        target_ret: torch.Tensor,
+        raw_data: dict[str, torch.Tensor],
+        valid_f: torch.Tensor,
+    ) -> torch.Tensor:
         slippage = self._compute_slippage(turnover, raw_data)
         safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
         pnl = position * safe_target - turnover * self.cost_rate - slippage
-        pnl = pnl * valid_f
+        return pnl * valid_f
+
+    def _build_trading_path(
+        self,
+        *,
+        factors: torch.Tensor,
+        raw_data: dict[str, torch.Tensor],
+        target_ret: torch.Tensor,
+    ) -> TradingPath:
+        valid = torch.isfinite(target_ret)
+        valid_f = valid.float()
+        signal = torch.tanh(factors)
+        position = self._build_position(signal, valid_f)
+        turnover = self._compute_turnover(position, valid_f)
+        pnl = self._compute_pnl(
+            position=position,
+            turnover=turnover,
+            target_ret=target_ret,
+            raw_data=raw_data,
+            valid_f=valid_f,
+        )
+        return TradingPath(valid=valid, valid_f=valid_f, position=position, turnover=turnover, pnl=pnl)
+
+    def _compute_score(self, path: TradingPath) -> tuple[torch.Tensor, float]:
+        valid = path.valid
+        valid_f = path.valid_f
+        pnl = path.pnl
+        position = path.position
+        turnover = path.turnover
 
         valid_count = valid_f.sum(dim=1)
         has_obs = valid_count > 0
@@ -190,28 +224,47 @@ class ChinaBacktest:
 
         use_down = neg_count > 5
         sortino = torch.where(use_down, mu / down_std, mu / std) * math.sqrt(self.annualization_factor)
-
         sortino = torch.where(mu < 0, torch.full_like(sortino, -2.0), sortino)
         sortino = torch.where(turnover.mean(dim=1) > 0.5, sortino - 1.0, sortino)
         sortino = torch.where(position.abs().sum(dim=1) == 0, torch.full_like(sortino, -2.0), sortino)
         sortino = torch.where(has_obs, sortino, torch.full_like(sortino, -2.0))
-
         sortino = torch.clamp(sortino, -3.0, 5.0)
+
         final_fitness = torch.median(sortino)
         total_valid = torch.clamp(valid_f.sum(), min=1.0)
         mean_return = (pnl.sum() / total_valid).item()
+        return final_fitness, mean_return
+
+    @staticmethod
+    def _compute_portfolio_curve(path: TradingPath) -> tuple[torch.Tensor, torch.Tensor]:
+        valid_per_t = path.valid_f.sum(dim=0)
+        portfolio_ret = torch.where(
+            valid_per_t > 0,
+            path.pnl.sum(dim=0) / torch.clamp(valid_per_t, min=1.0),
+            torch.zeros_like(valid_per_t),
+        )
+        equity_curve = torch.cumprod(torch.clamp(1.0 + portfolio_ret, min=1e-6), dim=0)
+        return portfolio_ret, equity_curve
+
+    def evaluate(
+        self,
+        factors: torch.Tensor,
+        raw_data: dict[str, torch.Tensor],
+        target_ret: torch.Tensor,
+        *,
+        return_details: bool = False,
+    ) -> BacktestResult:
+        if factors.numel() == 0:
+            return BacktestResult(score=torch.tensor(-2.0, device=target_ret.device), mean_return=0.0)
+
+        path = self._build_trading_path(factors=factors, raw_data=raw_data, target_ret=target_ret)
+        final_fitness, mean_return = self._compute_score(path)
 
         if not return_details:
             return BacktestResult(score=final_fitness, mean_return=mean_return)
 
-        valid_per_t = valid_f.sum(dim=0)
-        portfolio_ret = torch.where(
-            valid_per_t > 0,
-            pnl.sum(dim=0) / torch.clamp(valid_per_t, min=1.0),
-            torch.zeros_like(valid_per_t),
-        )
-        equity_curve = torch.cumprod(torch.clamp(1.0 + portfolio_ret, min=1e-6), dim=0)
-        metrics = self._compute_risk_metrics(portfolio_ret, equity_curve, turnover, position)
+        portfolio_ret, equity_curve = self._compute_portfolio_curve(path)
+        metrics = self._compute_risk_metrics(portfolio_ret, equity_curve, path.turnover, path.position)
 
         return BacktestResult(
             score=final_fitness,
