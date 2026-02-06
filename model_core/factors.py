@@ -1,6 +1,13 @@
 import torch
 import pandas as pd
-import pandas_ta as ta
+
+try:
+    import pandas_ta as ta
+except ImportError as exc:
+    raise ImportError(
+        "pandas_ta is required for feature generation. "
+        "Install with `conda install -c conda-forge pandas-ta`."
+    ) from exc
 
 class FeatureEngineer:
     """Feature engineer for China A-share/ETF data using pandas_ta."""

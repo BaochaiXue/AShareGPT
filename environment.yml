@@ -6,6 +6,7 @@ channels:
   - defaults
 dependencies:
   - python=3.11
+  - pandas-ta
   - pip
   - pip:
       - -r requirements.txt

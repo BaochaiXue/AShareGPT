@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 
 from .config import ModelConfig
+from .code_alias import load_code_alias_map
 from .factors import FeatureEngineer
 
 
@@ -41,6 +42,12 @@ class ChinaMinuteDataLoader:
         self.target_ret: Optional[torch.Tensor] = None
         self.dates: Optional[pd.DatetimeIndex] = None
         self.symbols: Optional[list[str]] = None
+        alias_path = Path(ModelConfig.CN_CODE_ALIAS_FILE)
+        if not alias_path.is_absolute():
+            alias_path = self.data_root.parent / alias_path
+        self.code_alias_map = load_code_alias_map(alias_path)
+        self._warned_missing_adj: set[str] = set()
+        self._warned_alias_adj: set[str] = set()
 
     def _parse_time(self, value: str) -> Optional[time]:
         if not value:
@@ -100,25 +107,39 @@ class ChinaMinuteDataLoader:
     def _load_adj_factors(self, code: str) -> Optional[pd.DataFrame]:
         if not ModelConfig.CN_USE_ADJ_FACTOR:
             return None
-        path = self.data_root / ModelConfig.CN_ADJ_FACTOR_DIR / f"{code}.csv"
-        if not path.exists():
-            return None
-        try:
-            df = self._read_adj_factor_csv(path)
-        except Exception:
-            return None
-        if df.empty or "adj_factor" not in df.columns or "date" not in df.columns:
-            return None
-        df = df.loc[:, ["date", "adj_factor"]].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"])
-        df["date"] = df["date"].dt.normalize()
-        df["adj_factor"] = pd.to_numeric(df["adj_factor"], errors="coerce")
-        df = df.dropna(subset=["adj_factor"])
-        if df.empty:
-            return None
-        df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
-        return df
+        alias_code = self.code_alias_map.get(code)
+        candidates = [code]
+        if alias_code and alias_code != code:
+            candidates.append(alias_code)
+
+        for candidate in candidates:
+            path = self.data_root / ModelConfig.CN_ADJ_FACTOR_DIR / f"{candidate}.csv"
+            if not path.exists():
+                continue
+            try:
+                df = self._read_adj_factor_csv(path)
+            except Exception:
+                continue
+            if df.empty or "adj_factor" not in df.columns or "date" not in df.columns:
+                continue
+            df = df.loc[:, ["date", "adj_factor"]].copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            df["date"] = df["date"].dt.normalize()
+            df["adj_factor"] = pd.to_numeric(df["adj_factor"], errors="coerce")
+            df = df.dropna(subset=["adj_factor"])
+            if df.empty:
+                continue
+            df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+            if candidate != code and code not in self._warned_alias_adj:
+                print(f"[adj] alias applied: {code} -> {candidate}")
+                self._warned_alias_adj.add(code)
+            return df
+
+        if code not in self._warned_missing_adj:
+            print(f"[adj] missing adj_factor for {code}; fallback to 1.0")
+            self._warned_missing_adj.add(code)
+        return None
 
     def _apply_adj_factors(self, code: str, frame: pd.DataFrame) -> pd.DataFrame:
         adj = self._load_adj_factors(code)

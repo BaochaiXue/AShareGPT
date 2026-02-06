@@ -28,6 +28,7 @@ class ModelConfig:
     CN_MINUTE_DATA_ROOT = os.getenv("CN_MINUTE_DATA_ROOT", "data")
     CN_USE_ADJ_FACTOR = os.getenv("CN_USE_ADJ_FACTOR", "1") == "1"
     CN_ADJ_FACTOR_DIR = os.getenv("CN_ADJ_FACTOR_DIR", "复权因子")
+    CN_CODE_ALIAS_FILE = os.getenv("CN_CODE_ALIAS_FILE", "code_alias_map.csv")
     CN_MINUTE_START_DATE = os.getenv("CN_MINUTE_START_DATE", "")
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
