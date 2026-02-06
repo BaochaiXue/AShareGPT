@@ -1,13 +1,19 @@
 import torch
 import pandas as pd
+from typing import Optional
 
 try:
     import pandas_ta as ta
-except ImportError as exc:
-    raise ImportError(
-        "pandas_ta is required for feature generation. "
-        "Install with `conda install -c conda-forge pandas-ta`."
-    ) from exc
+    if not hasattr(ta, "Strategy"):
+        raise ImportError("pandas_ta package does not provide Strategy API")
+except ImportError:
+    try:
+        import pandas_ta_classic as ta
+    except ImportError as exc:
+        raise ImportError(
+            "pandas_ta Strategy API is required for feature generation. "
+            "Install with `pip install pandas-ta-classic` or a compatible pandas_ta build."
+        ) from exc
 
 class FeatureEngineer:
     """Feature engineer for China A-share/ETF data using pandas_ta."""
@@ -47,17 +53,38 @@ class FeatureEngineer:
     INPUT_DIM = len(FEATURES)
 
     @staticmethod
-    def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
-        """Robust Z-Score Normalization (Cross-Sectional or Time-Series)."""
-        # Normalize along the last axis (time axis).
-        # Works for both [Batch, Time] and [Asset, Feature, Time].
+    def fit_robust_stats(t: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit robust normalization stats along time axis."""
         median = torch.nanmedian(t, dim=-1, keepdim=True)[0]
         mad = torch.nanmedian(torch.abs(t - median), dim=-1, keepdim=True)[0] + 1e-6
+        return {"median": median, "mad": mad}
+
+    @staticmethod
+    def apply_robust_norm(
+        t: torch.Tensor,
+        norm_stats: Optional[dict[str, torch.Tensor]] = None,
+        clip: float = 5.0,
+    ) -> torch.Tensor:
+        """Apply robust z-score using provided stats or self-fitted stats."""
+        stats = norm_stats or FeatureEngineer.fit_robust_stats(t)
+        median = stats["median"]
+        mad = stats["mad"]
         norm = (t - median) / mad
         return torch.clamp(norm, -clip, clip)
 
     @staticmethod
-    def compute_features(raw_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
+        """Backward-compatible robust normalization helper."""
+        return FeatureEngineer.apply_robust_norm(t, norm_stats=None, clip=clip)
+
+    @staticmethod
+    def compute_features(
+        raw_dict: dict[str, torch.Tensor],
+        *,
+        normalize: bool = True,
+        norm_stats: Optional[dict[str, torch.Tensor]] = None,
+        clip: float = 5.0,
+    ) -> torch.Tensor:
         """
         Compute features using pandas_ta.
         
@@ -107,12 +134,6 @@ class FeatureEngineer:
         CustomStrategy = ta.Strategy(
             name="AlphaGPT Strategy",
             ta=[
-                # Price Transform
-                {"kind": "avgprice"},
-                {"kind": "medprice"},
-                {"kind": "typprice"},
-                {"kind": "wclose"}, # requires OHLC
-                
                 # Returns
                 {"kind": "log_return", "cumulative": False},
                 {"kind": "percent_return", "length": 1},
@@ -153,7 +174,7 @@ class FeatureEngineer:
                 {"kind": "bbands", "length": 20},
                 {"kind": "midpoint"},
                 {"kind": "midprice"},
-                {"kind": "sar"},
+                {"kind": "psar"},
                 
                 # Volume
                 {"kind": "obv"},
@@ -206,10 +227,10 @@ class FeatureEngineer:
             feat_dict['AMOUNT'] = amounts[:, i] # Raw passed through
             
             # 2. Transformed Prices
-            feat_dict['AVGPRICE'] = get_col(["AVGPRICE"])
-            feat_dict['MEDPRICE'] = get_col(["MEDPRICE"])
-            feat_dict['TYPPRICE'] = get_col(["TYPPRICE"])
-            feat_dict['WCLOSE'] = get_col(["HLC3", "WCP"]) 
+            feat_dict['AVGPRICE'] = (df['open'].values + df['high'].values + df['low'].values + df['close'].values) / 4.0
+            feat_dict['MEDPRICE'] = (df['high'].values + df['low'].values) / 2.0
+            feat_dict['TYPPRICE'] = (df['high'].values + df['low'].values + df['close'].values) / 3.0
+            feat_dict['WCLOSE'] = (df['high'].values + df['low'].values + 2.0 * df['close'].values) / 4.0
             
             # 3. Returns
             feat_dict['RET'] = get_col(["PCTRET_1"])
@@ -262,7 +283,15 @@ class FeatureEngineer:
             
             feat_dict['MIDPOINT'] = get_col(["MIDPOINT_2"])
             feat_dict['MIDPRICE'] = get_col(["MIDPRICE_2"])
-            feat_dict['SAR'] = get_col(["SAR"])
+            if "PSARl_0.02_0.2" in df.columns and "PSARs_0.02_0.2" in df.columns:
+                sar_series = df["PSARl_0.02_0.2"].combine_first(df["PSARs_0.02_0.2"]).fillna(0.0)
+                feat_dict['SAR'] = sar_series.values
+            elif "PSARl_0.02_0.2" in df.columns:
+                feat_dict['SAR'] = df["PSARl_0.02_0.2"].fillna(0.0).values
+            elif "PSARs_0.02_0.2" in df.columns:
+                feat_dict['SAR'] = df["PSARs_0.02_0.2"].fillna(0.0).values
+            else:
+                feat_dict['SAR'] = get_col(["SAR"])
             
             # 7. Volume
             feat_dict['OBV'] = get_col(["OBV"])
@@ -274,7 +303,7 @@ class FeatureEngineer:
             # custom volume features not in pandas_ta strategy explicitly or need custom calc
             # V_RET
             v_curr = df['volume'].values
-            v_prev = pd.Series(v_curr).shift(1).fillna(method='bfill').values
+            v_prev = pd.Series(v_curr).shift(1).bfill().values
             feat_dict['V_RET'] = (v_curr / (v_prev + 1e-6)) - 1.0
             
             # VOL MA
@@ -294,9 +323,8 @@ class FeatureEngineer:
         # Post-process: NaN handling & Normalization
         feat_out = torch.nan_to_num(feat_out, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Apply Robust Normalization to everything?
-        # Yes, AlphaGPT expects roughly standard normal inputs.
-        # But we do this across Time per Asset (Time-Series Norm)
-        normalized = FeatureEngineer.robust_norm(feat_out)
-        
-        return normalized
+        if not normalize:
+            return feat_out
+
+        # Keep normalization optional so caller can avoid train/val leakage.
+        return FeatureEngineer.apply_robust_norm(feat_out, norm_stats=norm_stats, clip=clip)

@@ -12,7 +12,7 @@ Requirements:
 import os
 import sys
 
-from model_core.engine import AlphaEngine
+from model_core.entrypoints import create_train_use_case
 
 
 def main():
@@ -23,16 +23,16 @@ def main():
     print()
 
     try:
-        engine = AlphaEngine(use_lord_regularization=True)
-        engine.train()
+        train_use_case, _ = create_train_use_case(use_lord_regularization=True)
+        artifact = train_use_case.run()
 
         print("\n" + "=" * 60)
         print("✅ Training Complete!")
         print("=" * 60)
 
-        if engine.best_formula:
-            print(f"Best Score: {engine.best_score:.4f}")
-            print(f"Best Formula: {engine.best_formula}")
+        if artifact.best_formula:
+            print(f"Best Score: {artifact.best_score:.4f}")
+            print(f"Best Formula: {artifact.best_formula}")
         else:
             print("⚠️  No valid formula found. Try increasing TRAIN_STEPS.")
 

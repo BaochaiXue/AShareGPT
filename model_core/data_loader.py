@@ -42,6 +42,7 @@ class ChinaMinuteDataLoader:
         self.target_ret: Optional[torch.Tensor] = None
         self.dates: Optional[pd.DatetimeIndex] = None
         self.symbols: Optional[list[str]] = None
+        self.feature_norm_info: dict[str, int | str | float] = {}
         alias_path = Path(ModelConfig.CN_CODE_ALIAS_FILE)
         if not alias_path.is_absolute():
             alias_path = self.data_root.parent / alias_path
@@ -181,6 +182,80 @@ class ChinaMinuteDataLoader:
             val = max(0, total_len - train)
         test = max(0, total_len - train - val)
         return train, val, test
+
+    def _validate_split_order(
+        self,
+        dates: pd.DatetimeIndex,
+        train_len: int,
+        val_len: int,
+        test_len: int,
+    ) -> None:
+        if len(dates) == 0:
+            return
+        if not dates.is_monotonic_increasing:
+            raise ValueError("Date index is not sorted ascending.")
+        if train_len + val_len + test_len > len(dates):
+            raise ValueError("Split sizes exceed available data length.")
+
+        # Hard check: train < val < test chronological boundary.
+        if train_len > 0 and val_len > 0:
+            if dates[train_len - 1] >= dates[train_len]:
+                raise ValueError("Split order invalid: train end must be earlier than val start.")
+        if val_len > 0 and test_len > 0:
+            boundary = train_len + val_len
+            if dates[boundary - 1] >= dates[boundary]:
+                raise ValueError("Split order invalid: val end must be earlier than test start.")
+        if val_len == 0 and train_len > 0 and test_len > 0:
+            boundary = train_len
+            if dates[boundary - 1] >= dates[boundary]:
+                raise ValueError("Split order invalid: train end must be earlier than test start.")
+
+    def _validate_target_ret_mask(self, target_df: pd.DataFrame, target_tensor: torch.Tensor) -> None:
+        expected_nan = torch.tensor(
+            target_df.isna().to_numpy().T,
+            dtype=torch.bool,
+            device=target_tensor.device,
+        )
+        actual_nan = torch.isnan(target_tensor)
+        if not torch.equal(expected_nan, actual_nan):
+            raise ValueError("target_ret NaN mask changed after tensor conversion.")
+
+        # Hard check: missing target entries must not be copied from previous day.
+        for col_idx, col in enumerate(target_df.columns):
+            series = target_df[col]
+            missing_idx = series.index[series.isna()]
+            if len(missing_idx) == 0:
+                continue
+            pos = int(target_df.index.get_loc(missing_idx[0]))
+            if pos == 0:
+                continue
+            prev = series.iloc[pos - 1]
+            if pd.isna(prev):
+                continue
+            cur = target_tensor[col_idx, pos]
+            if torch.isfinite(cur):
+                if abs(float(cur.item()) - float(prev)) < 1e-12:
+                    raise ValueError(f"target_ret forward-fill detected for {col}.")
+
+    def _normalize_features(self, raw_feat: torch.Tensor, train_len: int) -> torch.Tensor:
+        mode = ModelConfig.CN_FEATURE_NORM
+        clip = ModelConfig.CN_FEATURE_CLIP
+        total_len = raw_feat.shape[2]
+
+        if mode == "none":
+            self.feature_norm_info = {"mode": "none", "fit_len": 0, "clip": clip}
+            return raw_feat
+        if mode != "train":
+            raise ValueError(f"Unsupported CN_FEATURE_NORM={mode}; expected 'none' or 'train'.")
+        if train_len <= 0:
+            raise ValueError("CN_FEATURE_NORM=train requires a non-empty train split.")
+        if train_len > total_len:
+            raise ValueError("Train split exceeds feature timeline length.")
+
+        train_feat = raw_feat[:, :, :train_len]
+        norm_stats = FeatureEngineer.fit_robust_stats(train_feat)
+        self.feature_norm_info = {"mode": "train", "fit_len": train_len, "clip": clip}
+        return FeatureEngineer.apply_robust_norm(raw_feat, norm_stats=norm_stats, clip=clip)
 
     def _slice_raw_data(self, start: int, end: int) -> dict[str, torch.Tensor]:
         if self.raw_data_cache is None:
@@ -337,30 +412,47 @@ class ChinaMinuteDataLoader:
                     frame = frame.iloc[-cutoff_days:]
                 per_code_frames[code] = frame
 
-        def build_pivot(field: str) -> pd.DataFrame:
+        def build_pivot(
+            field: str,
+            *,
+            ffill: bool = True,
+            fill_value: Optional[float] = 0.0,
+        ) -> pd.DataFrame:
             series_list = []
             for code, frame in per_code_frames.items():
                 s = frame.set_index("date")[field].rename(code)
                 series_list.append(s)
             pivot = pd.concat(series_list, axis=1).sort_index()
-            pivot = pivot.ffill().fillna(0.0)
+            if ffill:
+                pivot = pivot.ffill()
+            if fill_value is not None:
+                pivot = pivot.fillna(fill_value)
             return pivot
 
-        open_df = build_pivot("open")
-        high_df = build_pivot("high")
-        low_df = build_pivot("low")
-        close_df = build_pivot("close")
-        volume_df = build_pivot("volume")
-        amount_df = build_pivot("amount")
-        target_df = build_pivot("target_ret")
-        adj_df = build_pivot("adj_factor") if ModelConfig.CN_USE_ADJ_FACTOR else None
+        open_df = build_pivot("open", ffill=True, fill_value=0.0)
+        high_df = build_pivot("high", ffill=True, fill_value=0.0)
+        low_df = build_pivot("low", ffill=True, fill_value=0.0)
+        close_df = build_pivot("close", ffill=True, fill_value=0.0)
+        volume_df = build_pivot("volume", ffill=False, fill_value=0.0)
+        amount_df = build_pivot("amount", ffill=False, fill_value=0.0)
+        target_df = build_pivot("target_ret", ffill=False, fill_value=None)
+        adj_df = (
+            build_pivot("adj_factor", ffill=True, fill_value=1.0)
+            if ModelConfig.CN_USE_ADJ_FACTOR
+            else None
+        )
 
         index = close_df.index
         columns = close_df.columns
+        train_len, val_len, test_len = self._resolve_split_sizes(len(index))
+        self._validate_split_order(index, train_len, val_len, test_len)
 
         def to_tensor(pivot: pd.DataFrame) -> torch.Tensor:
             pivot = pivot.reindex(index=index, columns=columns)
             return torch.tensor(pivot.values.T, dtype=torch.float32, device=ModelConfig.DEVICE)
+
+        target_tensor = to_tensor(target_df)
+        self._validate_target_ret_mask(target_df, target_tensor)
 
         self.raw_data_cache = {
             "open": to_tensor(open_df),
@@ -375,9 +467,18 @@ class ChinaMinuteDataLoader:
         if adj_df is not None:
             self.raw_data_cache["adj_factor"] = to_tensor(adj_df)
 
-        self.feat_tensor = FeatureEngineer.compute_features(self.raw_data_cache)
-        self.target_ret = to_tensor(target_df)
+        raw_feat = FeatureEngineer.compute_features(self.raw_data_cache, normalize=False)
+        self.feat_tensor = self._normalize_features(raw_feat, train_len=train_len)
+        self.target_ret = target_tensor
         self.dates = index
         self.symbols = list(columns)
 
         print(f"CN Minute Data Ready. Shape: {self.feat_tensor.shape}")
+        if self.feature_norm_info:
+            print(
+                "[norm] mode={mode} fit_len={fit_len} clip={clip}".format(
+                    mode=self.feature_norm_info.get("mode"),
+                    fit_len=self.feature_norm_info.get("fit_len"),
+                    clip=self.feature_norm_info.get("clip"),
+                )
+            )

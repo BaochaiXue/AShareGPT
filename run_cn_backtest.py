@@ -14,12 +14,9 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import torch
 
 from model_core.config import ModelConfig
-from model_core.data_loader import ChinaMinuteDataLoader
-from model_core.backtest import ChinaBacktest
-from model_core.vm import StackVM
+from model_core.entrypoints import create_backtest_use_case
 
 
 def load_strategy(filepath: str) -> list:
@@ -70,96 +67,80 @@ def run_backtest(
     curve_out: str | None = None,
 ):
     print("Loading minute CSV data...")
-    loader = ChinaMinuteDataLoader()
-    loader.load_data(
-        codes=symbols or ModelConfig.CN_CODES,
-        years=ModelConfig.CN_MINUTE_YEARS,
-        start_date=ModelConfig.CN_MINUTE_START_DATE,
-        end_date=ModelConfig.CN_MINUTE_END_DATE,
-        signal_time=ModelConfig.CN_SIGNAL_TIME,
-        exit_time=ModelConfig.CN_EXIT_TIME,
+    mode = "walk_forward" if walk_forward else ("split" if split else "full")
+    backtest_use_case, _ = create_backtest_use_case()
+    use_case_result = backtest_use_case.run(
+        formula=formula,
+        mode=mode,
+        symbols=symbols,
         limit_codes=ModelConfig.CN_MAX_CODES,
+        return_details=True,
     )
-
-    print(f"Data shape: {loader.feat_tensor.shape}")
-    print(f"Symbols: {len(loader.symbols) if loader.symbols else 'N/A'}")
-    print(f"Date range: {loader.dates.min()} to {loader.dates.max()}")
-
-    print("\nExecuting strategy formula...")
-    vm = StackVM()
-    factors = vm.execute(formula, loader.feat_tensor)
-
-    if factors is None:
-        print("❌ Invalid formula - execution failed")
-        return
-
-    if factors.std() < 1e-4:
-        print("⚠️  Warning: Factor has near-zero variance (trivial formula)")
-
-    print("\nRunning backtest...")
-    bt = ChinaBacktest()
-
-    if walk_forward:
-        folds = loader.walk_forward_splits()
-        if not folds:
-            print("⚠️  Walk-forward disabled: not enough data for configured windows.")
-        else:
-            val_scores = []
-            test_scores = []
-            for idx, fold in enumerate(folds, 1):
-                if fold.val.end_idx > fold.val.start_idx:
-                    res_val = factors[:, fold.val.start_idx:fold.val.end_idx]
-                    val_result = bt.evaluate(
-                        res_val,
-                        fold.val.raw_data_cache,
-                        fold.val.target_ret,
-                        return_details=True,
-                    )
-                    print_metrics(f"Fold {idx} - Validation", val_result)
-                    val_scores.append(val_result.score.item())
-                if fold.test.end_idx > fold.test.start_idx:
-                    res_test = factors[:, fold.test.start_idx:fold.test.end_idx]
-                    test_result = bt.evaluate(
-                        res_test,
-                        fold.test.raw_data_cache,
-                        fold.test.target_ret,
-                        return_details=True,
-                    )
-                    print_metrics(f"Fold {idx} - Test", test_result)
-                    test_scores.append(test_result.score.item())
-            if val_scores:
-                print(f"\nWalk-forward Avg Val Score: {sum(val_scores) / len(val_scores):.4f}")
-            if test_scores:
-                print(f"Walk-forward Avg Test Score: {sum(test_scores) / len(test_scores):.4f}")
+    if not use_case_result.ok:
+        print(f"❌ {use_case_result.message}")
         return None
 
-    if split:
-        splits = loader.train_val_test_split()
+    payload = use_case_result.payload or {}
+    dates = payload.get("dates")
+    symbols_loaded = payload.get("symbols") or []
+    feat_shape = payload.get("feat_shape")
+    warnings = payload.get("warnings") or []
+
+    if dates is None:
+        print("❌ Backtest use-case returned incomplete payload")
+        return None
+
+    print(f"Data shape: {feat_shape}")
+    print(f"Symbols: {len(symbols_loaded) if symbols_loaded else 'N/A'}")
+    print(f"Date range: {dates.min()} to {dates.max()}")
+    print("\nExecuting strategy formula...")
+    for warning in warnings:
+        print(f"⚠️  Warning: {warning}")
+    print("\nRunning backtest...")
+
+    if mode == "walk_forward":
+        folds = payload.get("folds") or []
+        if not folds:
+            print(f"⚠️  {use_case_result.message}")
+            return None
+        for fold in folds:
+            idx = fold.get("index")
+            val_result = fold.get("val")
+            test_result = fold.get("test")
+            if val_result is not None:
+                print_metrics(f"Fold {idx} - Validation", val_result)
+            if test_result is not None:
+                print_metrics(f"Fold {idx} - Test", test_result)
+        avg_val_score = payload.get("avg_val_score")
+        avg_test_score = payload.get("avg_test_score")
+        if avg_val_score is not None:
+            print(f"\nWalk-forward Avg Val Score: {avg_val_score:.4f}")
+        if avg_test_score is not None:
+            print(f"Walk-forward Avg Test Score: {avg_test_score:.4f}")
+        return None
+
+    if mode == "split":
+        split_results = payload.get("splits") or {}
         for name in ("train", "val", "test"):
-            if name not in splits:
+            out = split_results.get(name)
+            if not out:
                 continue
-            split_slice = splits[name]
-            res_slice = factors[:, split_slice.start_idx:split_slice.end_idx]
-            result = bt.evaluate(
-                res_slice,
-                split_slice.raw_data_cache,
-                split_slice.target_ret,
-                return_details=True,
-            )
+            result = out.get("result")
+            split_dates = out.get("dates")
+            if result is None or split_dates is None:
+                continue
             print_metrics(f"{name.capitalize()} Results", result)
             if curve_out:
                 suffix = f"_{name}"
                 out_path = Path(curve_out)
                 out_file = out_path.with_name(f"{out_path.stem}{suffix}{out_path.suffix or '.csv'}")
-                save_equity_curve(str(out_file), split_slice.dates, result)
+                save_equity_curve(str(out_file), split_dates, result)
         return None
 
-    result = bt.evaluate(
-        factors,
-        loader.raw_data_cache,
-        loader.target_ret,
-        return_details=True,
-    )
+    result = payload.get("result")
+    if result is None:
+        print("❌ Backtest use-case returned no full-sample result")
+        return None
 
     print("\n" + "=" * 60)
     print("📊 Backtest Results")
@@ -167,7 +148,7 @@ def run_backtest(
     print_metrics("Full Sample", result)
 
     if curve_out:
-        save_equity_curve(curve_out, loader.dates, result)
+        save_equity_curve(curve_out, dates, result)
 
     return {
         'score': result.score.item(),

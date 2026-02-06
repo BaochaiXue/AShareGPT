@@ -46,6 +46,8 @@ class ModelConfig:
     CN_WFO_VAL_DAYS = int(os.getenv("CN_WFO_VAL_DAYS", "20"))
     CN_WFO_TEST_DAYS = int(os.getenv("CN_WFO_TEST_DAYS", "20"))
     CN_WFO_STEP_DAYS = int(os.getenv("CN_WFO_STEP_DAYS", "20"))
+    CN_FEATURE_NORM = os.getenv("CN_FEATURE_NORM", "train").strip().lower()
+    CN_FEATURE_CLIP = float(os.getenv("CN_FEATURE_CLIP", "5.0"))
     _CN_CODES_RAW = os.getenv("CN_CODES", "")
     CN_CODES = [c.strip() for c in _CN_CODES_RAW.split(",") if c.strip()]
     _CN_MINUTE_YEARS_RAW = os.getenv("CN_MINUTE_YEARS", "")

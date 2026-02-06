@@ -252,6 +252,7 @@ channels:
   - defaults
 dependencies:
   - python=3.11
+  - pandas-ta
   - pip
   - pip:
       - -r requirements.txt
@@ -927,6 +928,41 @@ class ChinaBacktest:
         )
 ```
 
+model_core/code_alias.py
+```python
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+
+def load_code_alias_map(path: Path) -> dict[str, str]:
+    """Load code alias mapping from CSV: old_code,new_code."""
+    if not path.exists():
+        return {}
+
+    mapping: dict[str, str] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return {}
+        field_map = {name.strip().lower(): name for name in reader.fieldnames}
+        old_col = field_map.get("old_code")
+        new_col = field_map.get("new_code")
+        if not old_col or not new_col:
+            return {}
+
+        for row in reader:
+            old_code = (row.get(old_col) or "").strip()
+            new_code = (row.get(new_col) or "").strip()
+            if not old_code or not new_code:
+                continue
+            if old_code == new_code:
+                continue
+            mapping[old_code] = new_code
+    return mapping
+```
+
 model_core/config.py
 ```python
 import os
@@ -959,6 +995,7 @@ class ModelConfig:
     CN_MINUTE_DATA_ROOT = os.getenv("CN_MINUTE_DATA_ROOT", "data")
     CN_USE_ADJ_FACTOR = os.getenv("CN_USE_ADJ_FACTOR", "1") == "1"
     CN_ADJ_FACTOR_DIR = os.getenv("CN_ADJ_FACTOR_DIR", "复权因子")
+    CN_CODE_ALIAS_FILE = os.getenv("CN_CODE_ALIAS_FILE", "code_alias_map.csv")
     CN_MINUTE_START_DATE = os.getenv("CN_MINUTE_START_DATE", "")
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
@@ -995,6 +1032,7 @@ import pandas as pd
 import torch
 
 from .config import ModelConfig
+from .code_alias import load_code_alias_map
 from .factors import FeatureEngineer
 
 
@@ -1029,6 +1067,12 @@ class ChinaMinuteDataLoader:
         self.target_ret: Optional[torch.Tensor] = None
         self.dates: Optional[pd.DatetimeIndex] = None
         self.symbols: Optional[list[str]] = None
+        alias_path = Path(ModelConfig.CN_CODE_ALIAS_FILE)
+        if not alias_path.is_absolute():
+            alias_path = self.data_root.parent / alias_path
+        self.code_alias_map = load_code_alias_map(alias_path)
+        self._warned_missing_adj: set[str] = set()
+        self._warned_alias_adj: set[str] = set()
 
     def _parse_time(self, value: str) -> Optional[time]:
         if not value:
@@ -1088,25 +1132,39 @@ class ChinaMinuteDataLoader:
     def _load_adj_factors(self, code: str) -> Optional[pd.DataFrame]:
         if not ModelConfig.CN_USE_ADJ_FACTOR:
             return None
-        path = self.data_root / ModelConfig.CN_ADJ_FACTOR_DIR / f"{code}.csv"
-        if not path.exists():
-            return None
-        try:
-            df = self._read_adj_factor_csv(path)
-        except Exception:
-            return None
-        if df.empty or "adj_factor" not in df.columns or "date" not in df.columns:
-            return None
-        df = df.loc[:, ["date", "adj_factor"]].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"])
-        df["date"] = df["date"].dt.normalize()
-        df["adj_factor"] = pd.to_numeric(df["adj_factor"], errors="coerce")
-        df = df.dropna(subset=["adj_factor"])
-        if df.empty:
-            return None
-        df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
-        return df
+        alias_code = self.code_alias_map.get(code)
+        candidates = [code]
+        if alias_code and alias_code != code:
+            candidates.append(alias_code)
+
+        for candidate in candidates:
+            path = self.data_root / ModelConfig.CN_ADJ_FACTOR_DIR / f"{candidate}.csv"
+            if not path.exists():
+                continue
+            try:
+                df = self._read_adj_factor_csv(path)
+            except Exception:
+                continue
+            if df.empty or "adj_factor" not in df.columns or "date" not in df.columns:
+                continue
+            df = df.loc[:, ["date", "adj_factor"]].copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            df["date"] = df["date"].dt.normalize()
+            df["adj_factor"] = pd.to_numeric(df["adj_factor"], errors="coerce")
+            df = df.dropna(subset=["adj_factor"])
+            if df.empty:
+                continue
+            df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+            if candidate != code and code not in self._warned_alias_adj:
+                print(f"[adj] alias applied: {code} -> {candidate}")
+                self._warned_alias_adj.add(code)
+            return df
+
+        if code not in self._warned_missing_adj:
+            print(f"[adj] missing adj_factor for {code}; fallback to 1.0")
+            self._warned_missing_adj.add(code)
+        return None
 
     def _apply_adj_factors(self, code: str, frame: pd.DataFrame) -> pd.DataFrame:
         adj = self._load_adj_factors(code)
@@ -1723,7 +1781,14 @@ model_core/factors.py
 ```python
 import torch
 import pandas as pd
-import pandas_ta as ta
+
+try:
+    import pandas_ta as ta
+except ImportError as exc:
+    raise ImportError(
+        "pandas_ta is required for feature generation. "
+        "Install with `conda install -c conda-forge pandas-ta`."
+    ) from exc
 
 class FeatureEngineer:
     """Feature engineer for China A-share/ETF data using pandas_ta."""
@@ -2442,6 +2507,192 @@ def main():
         print("  2. Date filters exclude all data")
         print("  3. CN_CODES/CN_MINUTE_YEARS not set")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+scripts/backfill_adj_by_alias.py
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+
+from model_core.code_alias import load_code_alias_map
+
+
+ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+
+
+def read_adj_csv(path: Path) -> pd.DataFrame:
+    last_err: Optional[Exception] = None
+    for enc in ENCODINGS:
+        try:
+            return pd.read_csv(
+                path,
+                usecols=lambda c: c in {"code", "date", "adj_factor", "证券代码"},
+                dtype={"date": "string"},
+                encoding=enc,
+            )
+        except Exception as exc:
+            last_err = exc
+    if last_err is not None:
+        raise last_err
+    return pd.DataFrame()
+
+
+def collect_minute_codes(data_root: Path) -> set[str]:
+    codes: set[str] = set()
+    for year_dir in sorted(data_root.iterdir()):
+        if not year_dir.is_dir() or not year_dir.name.isdigit():
+            continue
+        for path in year_dir.glob("*.csv"):
+            codes.add(path.stem)
+    return codes
+
+
+def normalize_adj(df: pd.DataFrame, old_code: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "code" not in df.columns and "证券代码" in df.columns:
+        df = df.rename(columns={"证券代码": "code"})
+    for col in ("date", "adj_factor"):
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    out = df.loc[:, ["date", "adj_factor"]].copy()
+    out["date"] = pd.to_numeric(out["date"], errors="coerce").astype("Int64").astype("string")
+    out["adj_factor"] = pd.to_numeric(out["adj_factor"], errors="coerce")
+    out = out.dropna(subset=["date", "adj_factor"])
+    out = out.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+    if out.empty:
+        return out
+    out.insert(0, "code", old_code)
+    return out
+
+
+def write_adj(path: Path, df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Backfill missing old-code adj files from mapped new-code adj files."
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "data",
+        help="Data root containing year folders and adj factor folder.",
+    )
+    parser.add_argument(
+        "--alias-file",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "code_alias_map.csv",
+        help="CSV with old_code,new_code columns.",
+    )
+    parser.add_argument(
+        "--adj-dir",
+        type=str,
+        default="复权因子",
+        help="Adj factor directory name under data root.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing old-code adj files.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan only, do not write files.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Optional CSV report output path.",
+    )
+    args = parser.parse_args()
+
+    data_root = args.data_root
+    adj_root = data_root / args.adj_dir
+    alias_file = args.alias_file
+
+    alias_map = load_code_alias_map(alias_file)
+    if not alias_map:
+        raise SystemExit(f"No valid alias mapping found: {alias_file}")
+
+    minute_codes = collect_minute_codes(data_root)
+    stats = {
+        "created": 0,
+        "overwritten": 0,
+        "skipped_exists": 0,
+        "skipped_no_minute": 0,
+        "missing_source": 0,
+        "invalid_source": 0,
+    }
+
+    report_handle = None
+    report_writer = None
+    if args.report is not None:
+        report_handle = args.report.open("w", encoding="utf-8", newline="")
+        report_writer = csv.writer(report_handle, lineterminator="\n")
+        report_writer.writerow(["old_code", "new_code", "status", "rows"])
+
+    try:
+        for old_code, new_code in sorted(alias_map.items()):
+            status = ""
+            rows = 0
+            dst = adj_root / f"{old_code}.csv"
+            src = adj_root / f"{new_code}.csv"
+            dst_exists_before = dst.exists()
+
+            if old_code not in minute_codes:
+                status = "skipped_no_minute"
+                stats[status] += 1
+            elif dst_exists_before and not args.overwrite:
+                status = "skipped_exists"
+                stats[status] += 1
+            elif not src.exists():
+                status = "missing_source"
+                stats[status] += 1
+            else:
+                try:
+                    df = read_adj_csv(src)
+                    out = normalize_adj(df, old_code)
+                except Exception:
+                    out = pd.DataFrame()
+                if out.empty:
+                    status = "invalid_source"
+                    stats[status] += 1
+                else:
+                    rows = int(len(out))
+                    if not args.dry_run:
+                        write_adj(dst, out)
+                    status = "overwritten" if dst_exists_before else "created"
+                    stats[status] += 1
+
+            print(f"{old_code} <- {new_code}: {status} rows={rows}")
+            if report_writer is not None:
+                report_writer.writerow([old_code, new_code, status, rows])
+    finally:
+        if report_handle is not None:
+            report_handle.close()
+
+    print("done")
+    for key in ("created", "overwritten", "skipped_exists", "skipped_no_minute", "missing_source", "invalid_source"):
+        print(f"{key}: {stats[key]}")
+    if args.dry_run:
+        print("dry_run: no files modified")
 
 
 if __name__ == "__main__":

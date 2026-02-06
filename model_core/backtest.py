@@ -143,6 +143,8 @@ class ChinaBacktest:
         if factors.numel() == 0:
             return BacktestResult(score=torch.tensor(-2.0, device=target_ret.device), mean_return=0.0)
 
+        valid = torch.isfinite(target_ret)
+        valid_f = valid.float()
         signal = torch.tanh(factors)
 
         if self.allow_short:
@@ -154,17 +156,29 @@ class ChinaBacktest:
             position = torch.roll(position, self.signal_lag, dims=1)
             position[:, : self.signal_lag] = 0.0
 
+        # Do not hold positions when target return is missing.
+        position = position * valid_f
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
+        valid_prev = torch.roll(valid, 1, dims=1)
+        valid_prev[:, 0] = False
+        turnover = turnover * (valid & valid_prev).float()
 
         slippage = self._compute_slippage(turnover, raw_data)
-        pnl = position * target_ret - turnover * self.cost_rate - slippage
+        safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
+        pnl = position * safe_target - turnover * self.cost_rate - slippage
+        pnl = pnl * valid_f
 
-        mu = pnl.mean(dim=1)
-        std = pnl.std(dim=1) + 1e-6
+        valid_count = valid_f.sum(dim=1)
+        has_obs = valid_count > 0
+        valid_count_safe = torch.clamp(valid_count, min=1.0)
 
-        neg_mask = pnl < 0
+        mu = pnl.sum(dim=1) / valid_count_safe
+        centered = (pnl - mu.unsqueeze(1)) * valid_f
+        std = torch.sqrt((centered ** 2).sum(dim=1) / valid_count_safe + 1e-6)
+
+        neg_mask = (pnl < 0) & valid
         neg_count = neg_mask.sum(dim=1)
         downside = torch.where(neg_mask, pnl, torch.zeros_like(pnl))
         down_mean = downside.sum(dim=1) / torch.clamp(neg_count, min=1)
@@ -178,15 +192,22 @@ class ChinaBacktest:
         sortino = torch.where(mu < 0, torch.full_like(sortino, -2.0), sortino)
         sortino = torch.where(turnover.mean(dim=1) > 0.5, sortino - 1.0, sortino)
         sortino = torch.where(position.abs().sum(dim=1) == 0, torch.full_like(sortino, -2.0), sortino)
+        sortino = torch.where(has_obs, sortino, torch.full_like(sortino, -2.0))
 
         sortino = torch.clamp(sortino, -3.0, 5.0)
         final_fitness = torch.median(sortino)
-        mean_return = pnl.mean(dim=1).mean().item()
+        total_valid = torch.clamp(valid_f.sum(), min=1.0)
+        mean_return = (pnl.sum() / total_valid).item()
 
         if not return_details:
             return BacktestResult(score=final_fitness, mean_return=mean_return)
 
-        portfolio_ret = pnl.mean(dim=0)
+        valid_per_t = valid_f.sum(dim=0)
+        portfolio_ret = torch.where(
+            valid_per_t > 0,
+            pnl.sum(dim=0) / torch.clamp(valid_per_t, min=1.0),
+            torch.zeros_like(valid_per_t),
+        )
         equity_curve = torch.cumprod(torch.clamp(1.0 + portfolio_ret, min=1e-6), dim=0)
         metrics = self._compute_risk_metrics(portfolio_ret, equity_curve, turnover, position)
 
