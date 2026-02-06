@@ -1,12 +1,6 @@
-# AShareGPT - Python Dependencies
-# Python 3.10+ recommended (3.11 ok)
-
-# Core
-torch>=2.0.0
-numpy>=1.24.0
-pandas>=2.0.0
-
-# Utilities
-tqdm>=4.66.0
-loguru>=0.7.0
-python-dotenv>=1.0.0
+pandas
+torch
+tqdm
+numpy
+scipy
+pandas_ta

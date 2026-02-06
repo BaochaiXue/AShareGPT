@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
@@ -7,6 +8,24 @@ import torch
 
 from .config import ModelConfig
 from .factors import FeatureEngineer
+
+
+@dataclass
+class DataSlice:
+    feat_tensor: torch.Tensor
+    raw_data_cache: dict[str, torch.Tensor]
+    target_ret: torch.Tensor
+    dates: pd.DatetimeIndex
+    symbols: list[str]
+    start_idx: int
+    end_idx: int
+
+
+@dataclass
+class WalkForwardFold:
+    train: DataSlice
+    val: DataSlice
+    test: DataSlice
 
 
 class ChinaMinuteDataLoader:
@@ -60,6 +79,145 @@ class ChinaMinuteDataLoader:
                 break
         candidates = sorted(set(candidates))
         return candidates[:limit_codes] if limit_codes else candidates
+
+    def _read_adj_factor_csv(self, path: Path) -> pd.DataFrame:
+        encodings = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+        last_err: Optional[Exception] = None
+        for enc in encodings:
+            try:
+                return pd.read_csv(
+                    path,
+                    usecols=lambda c: c in {"date", "adj_factor", "code", "证券代码"},
+                    dtype={"date": "string"},
+                    encoding=enc,
+                )
+            except Exception as exc:
+                last_err = exc
+        if last_err:
+            raise last_err
+        return pd.DataFrame()
+
+    def _load_adj_factors(self, code: str) -> Optional[pd.DataFrame]:
+        if not ModelConfig.CN_USE_ADJ_FACTOR:
+            return None
+        path = self.data_root / ModelConfig.CN_ADJ_FACTOR_DIR / f"{code}.csv"
+        if not path.exists():
+            return None
+        try:
+            df = self._read_adj_factor_csv(path)
+        except Exception:
+            return None
+        if df.empty or "adj_factor" not in df.columns or "date" not in df.columns:
+            return None
+        df = df.loc[:, ["date", "adj_factor"]].copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df["date"] = df["date"].dt.normalize()
+        df["adj_factor"] = pd.to_numeric(df["adj_factor"], errors="coerce")
+        df = df.dropna(subset=["adj_factor"])
+        if df.empty:
+            return None
+        df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+        return df
+
+    def _apply_adj_factors(self, code: str, frame: pd.DataFrame) -> pd.DataFrame:
+        adj = self._load_adj_factors(code)
+        if adj is None or adj.empty:
+            frame["adj_factor"] = 1.0
+            return frame
+        merged = frame.merge(adj, on="date", how="left").sort_values("date")
+        merged["adj_factor"] = merged["adj_factor"].ffill().fillna(1.0)
+        for col in ("open", "high", "low", "close"):
+            merged[col] = merged[col].astype("float64") * merged["adj_factor"]
+        return merged
+
+    def _resolve_split_sizes(self, total_len: int) -> tuple[int, int, int]:
+        if total_len <= 0:
+            return 0, 0, 0
+        if ModelConfig.CN_TRAIN_DAYS or ModelConfig.CN_VAL_DAYS or ModelConfig.CN_TEST_DAYS:
+            train = max(0, ModelConfig.CN_TRAIN_DAYS)
+            val = max(0, ModelConfig.CN_VAL_DAYS)
+            test = max(0, ModelConfig.CN_TEST_DAYS)
+            if train + val + test == 0:
+                train = total_len
+            if train + val + test < total_len:
+                test += total_len - (train + val + test)
+            if train + val + test > total_len:
+                overflow = train + val + test - total_len
+                test = max(0, test - overflow)
+            if train + val + test > total_len:
+                overflow = train + val + test - total_len
+                val = max(0, val - overflow)
+            if train + val + test > total_len:
+                overflow = train + val + test - total_len
+                train = max(0, train - overflow)
+            return train, val, test
+        train = int(total_len * ModelConfig.CN_TRAIN_RATIO)
+        val = int(total_len * ModelConfig.CN_VAL_RATIO)
+        if train <= 0:
+            train = max(1, total_len - val)
+        if train + val > total_len:
+            val = max(0, total_len - train)
+        test = max(0, total_len - train - val)
+        return train, val, test
+
+    def _slice_raw_data(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        if self.raw_data_cache is None:
+            raise ValueError("raw_data_cache is empty. Call load_data() first.")
+        return {k: v[:, start:end] for k, v in self.raw_data_cache.items()}
+
+    def get_slice(self, start: int, end: int) -> DataSlice:
+        if self.feat_tensor is None or self.target_ret is None or self.dates is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        start = max(0, start)
+        end = max(start, min(end, self.feat_tensor.shape[2]))
+        return DataSlice(
+            feat_tensor=self.feat_tensor[:, :, start:end],
+            raw_data_cache=self._slice_raw_data(start, end),
+            target_ret=self.target_ret[:, start:end],
+            dates=self.dates[start:end],
+            symbols=self.symbols or [],
+            start_idx=start,
+            end_idx=end,
+        )
+
+    def train_val_test_split(self) -> dict[str, DataSlice]:
+        if self.dates is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        total_len = len(self.dates)
+        train_len, val_len, test_len = self._resolve_split_sizes(total_len)
+        splits: dict[str, DataSlice] = {}
+        cursor = 0
+        if train_len > 0:
+            splits["train"] = self.get_slice(cursor, cursor + train_len)
+            cursor += train_len
+        if val_len > 0:
+            splits["val"] = self.get_slice(cursor, cursor + val_len)
+            cursor += val_len
+        if test_len > 0:
+            splits["test"] = self.get_slice(cursor, cursor + test_len)
+        return splits
+
+    def walk_forward_splits(self) -> list[WalkForwardFold]:
+        if self.dates is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        total_len = len(self.dates)
+        train_len = max(0, ModelConfig.CN_WFO_TRAIN_DAYS)
+        val_len = max(0, ModelConfig.CN_WFO_VAL_DAYS)
+        test_len = max(0, ModelConfig.CN_WFO_TEST_DAYS)
+        step_len = max(1, ModelConfig.CN_WFO_STEP_DAYS)
+        window = train_len + val_len + test_len
+        if window <= 0 or total_len < window:
+            return []
+        folds: list[WalkForwardFold] = []
+        start = 0
+        while start + window <= total_len:
+            train_slice = self.get_slice(start, start + train_len)
+            val_slice = self.get_slice(start + train_len, start + train_len + val_len)
+            test_slice = self.get_slice(start + train_len + val_len, start + window)
+            folds.append(WalkForwardFold(train=train_slice, val=val_slice, test=test_slice))
+            start += step_len
+        return folds
 
     def load_data(
         self,
@@ -143,6 +301,8 @@ class ChinaMinuteDataLoader:
             if records:
                 frame = pd.DataFrame(records)
                 frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+                if ModelConfig.CN_USE_ADJ_FACTOR:
+                    frame = self._apply_adj_factors(code, frame)
                 per_code_frames[code] = frame
 
         if not per_code_frames:
@@ -172,6 +332,7 @@ class ChinaMinuteDataLoader:
         volume_df = build_pivot("volume")
         amount_df = build_pivot("amount")
         target_df = build_pivot("target_ret")
+        adj_df = build_pivot("adj_factor") if ModelConfig.CN_USE_ADJ_FACTOR else None
 
         index = close_df.index
         columns = close_df.columns
@@ -190,6 +351,8 @@ class ChinaMinuteDataLoader:
             "liquidity": to_tensor(amount_df),
             "fdv": to_tensor(amount_df),
         }
+        if adj_df is not None:
+            self.raw_data_cache["adj_factor"] = to_tensor(adj_df)
 
         self.feat_tensor = FeatureEngineer.compute_features(self.raw_data_cache)
         self.target_ret = to_tensor(target_df)

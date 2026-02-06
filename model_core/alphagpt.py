@@ -86,7 +86,7 @@ class StableRankMonitor:
     
     def __init__(self, model: nn.Module, target_keywords: Optional[list[str]] = None):
         self.model = model
-        self.target_keywords = target_keywords or ["q_proj", "k_proj", "attention"]
+        self.target_keywords = target_keywords or ["attention", "in_proj", "out_proj"]
         self.history: list[float] = []
     
     @torch.no_grad()

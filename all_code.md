@@ -463,7 +463,7 @@ class StableRankMonitor:
     
     def __init__(self, model: nn.Module, target_keywords: Optional[list[str]] = None):
         self.model = model
-        self.target_keywords = target_keywords or ["q_proj", "k_proj", "attention"]
+        self.target_keywords = target_keywords or ["attention", "in_proj", "out_proj"]
         self.history: list[float] = []
     
     @torch.no_grad()
@@ -725,28 +725,150 @@ class AlphaGPT(nn.Module):
 
 model_core/backtest.py
 ```python
+import math
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
+
 from .config import ModelConfig
+
+
+@dataclass
+class BacktestResult:
+    score: torch.Tensor
+    mean_return: float
+    metrics: Optional[dict[str, float]] = None
+    equity_curve: Optional[torch.Tensor] = None
+    portfolio_returns: Optional[torch.Tensor] = None
 
 
 class ChinaBacktest:
     """
     Vectorized backtest for China A-share/ETF.
-    Uses open-to-open returns with turnover-based transaction cost.
+    Uses open-to-open returns with turnover-based transaction cost,
+    signal lag, and optional slippage.
     """
 
     def __init__(self):
         self.cost_rate = ModelConfig.COST_RATE
+        self.slippage_rate = ModelConfig.SLIPPAGE_RATE
+        self.slippage_impact = ModelConfig.SLIPPAGE_IMPACT
         self.allow_short = ModelConfig.ALLOW_SHORT
+        self.signal_lag = max(0, ModelConfig.SIGNAL_LAG)
+        self.annualization_factor = max(1, ModelConfig.ANNUALIZATION_FACTOR)
+
+    def _compute_slippage(
+        self,
+        turnover: torch.Tensor,
+        raw_data: Optional[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        if (self.slippage_rate <= 0) and (self.slippage_impact <= 0):
+            return torch.zeros_like(turnover)
+
+        slip = turnover * self.slippage_rate
+        if (
+            self.slippage_impact > 0
+            and raw_data
+            and {"high", "low", "open"}.issubset(raw_data.keys())
+        ):
+            hl_range = (raw_data["high"] - raw_data["low"]).abs() / (raw_data["open"].abs() + 1e-6)
+            slip = slip + turnover * self.slippage_impact * hl_range
+        return slip
+
+    def _compute_risk_metrics(
+        self,
+        portfolio_ret: torch.Tensor,
+        equity_curve: torch.Tensor,
+        turnover: torch.Tensor,
+        position: torch.Tensor,
+    ) -> dict[str, float]:
+        eps = 1e-12
+        n = portfolio_ret.numel()
+        if n == 0:
+            return {}
+
+        mean = portfolio_ret.mean()
+        std = portfolio_ret.std(unbiased=False)
+        ann_factor = float(self.annualization_factor)
+
+        ann_return = torch.pow(torch.clamp(1.0 + mean, min=eps), ann_factor) - 1.0
+        ann_vol = std * math.sqrt(ann_factor)
+        sharpe = (mean / (std + eps)) * math.sqrt(ann_factor)
+
+        downside = torch.clamp(portfolio_ret, max=0.0)
+        down_std = downside.std(unbiased=False)
+        sortino = (mean / (down_std + eps)) * math.sqrt(ann_factor)
+
+        equity_end = equity_curve[-1]
+        total_return = equity_end - 1.0
+        years = n / ann_factor if ann_factor > 0 else 0.0
+        if years > 0:
+            cagr = torch.pow(torch.clamp(equity_end, min=eps), 1.0 / years) - 1.0
+        else:
+            cagr = torch.tensor(0.0, device=portfolio_ret.device)
+
+        peak = torch.cummax(equity_curve, dim=0)[0]
+        drawdown = equity_curve / peak - 1.0
+        max_drawdown = drawdown.min()
+        calmar = cagr / (max_drawdown.abs() + eps)
+
+        pos = portfolio_ret[portfolio_ret > 0]
+        neg = portfolio_ret[portfolio_ret < 0]
+        win_rate = (portfolio_ret > 0).float().mean()
+        avg_win = pos.mean() if pos.numel() > 0 else torch.tensor(0.0, device=portfolio_ret.device)
+        avg_loss = neg.mean() if neg.numel() > 0 else torch.tensor(0.0, device=portfolio_ret.device)
+        profit_factor = pos.sum() / (neg.abs().sum() + eps) if neg.numel() > 0 else torch.tensor(float("inf"))
+        expectancy = win_rate * avg_win + (1.0 - win_rate) * avg_loss
+
+        centered = portfolio_ret - mean
+        m3 = (centered ** 3).mean()
+        m4 = (centered ** 4).mean()
+        skew = m3 / (std ** 3 + eps)
+        kurtosis = m4 / (std ** 4 + eps) - 3.0
+
+        avg_turnover = turnover.mean()
+        gross_exposure = position.abs().mean()
+        long_ratio = (position > 0).float().mean()
+        short_ratio = (position < 0).float().mean()
+        flat_ratio = (position == 0).float().mean()
+
+        def to_float(value: torch.Tensor) -> float:
+            return float(value.detach().cpu().item())
+
+        return {
+            "total_return": to_float(total_return),
+            "cagr": to_float(cagr),
+            "annual_return": to_float(ann_return),
+            "annual_vol": to_float(ann_vol),
+            "sharpe": to_float(sharpe),
+            "sortino": to_float(sortino),
+            "max_drawdown": to_float(max_drawdown),
+            "calmar": to_float(calmar),
+            "win_rate": to_float(win_rate),
+            "profit_factor": float(to_float(profit_factor)) if torch.isfinite(profit_factor).item() else float("inf"),
+            "avg_win": to_float(avg_win),
+            "avg_loss": to_float(avg_loss),
+            "expectancy": to_float(expectancy),
+            "skew": to_float(skew),
+            "kurtosis": to_float(kurtosis),
+            "avg_turnover": to_float(avg_turnover),
+            "gross_exposure": to_float(gross_exposure),
+            "long_ratio": to_float(long_ratio),
+            "short_ratio": to_float(short_ratio),
+            "flat_ratio": to_float(flat_ratio),
+        }
 
     def evaluate(
         self,
         factors: torch.Tensor,
         raw_data: dict[str, torch.Tensor],
         target_ret: torch.Tensor,
-    ) -> tuple[torch.Tensor, float]:
+        *,
+        return_details: bool = False,
+    ) -> BacktestResult:
         if factors.numel() == 0:
-            return torch.tensor(-2.0, device=target_ret.device), 0.0
+            return BacktestResult(score=torch.tensor(-2.0, device=target_ret.device), mean_return=0.0)
 
         signal = torch.tanh(factors)
 
@@ -755,11 +877,16 @@ class ChinaBacktest:
         else:
             position = (signal > 0).float()
 
+        if self.signal_lag > 0:
+            position = torch.roll(position, self.signal_lag, dims=1)
+            position[:, : self.signal_lag] = 0.0
+
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
 
-        pnl = position * target_ret - turnover * self.cost_rate
+        slippage = self._compute_slippage(turnover, raw_data)
+        pnl = position * target_ret - turnover * self.cost_rate - slippage
 
         mu = pnl.mean(dim=1)
         std = pnl.std(dim=1) + 1e-6
@@ -773,7 +900,7 @@ class ChinaBacktest:
         down_std = torch.sqrt(down_var + 1e-6)
 
         use_down = neg_count > 5
-        sortino = torch.where(use_down, mu / down_std, mu / std) * 15.87
+        sortino = torch.where(use_down, mu / down_std, mu / std) * math.sqrt(self.annualization_factor)
 
         sortino = torch.where(mu < 0, torch.full_like(sortino, -2.0), sortino)
         sortino = torch.where(turnover.mean(dim=1) > 0.5, sortino - 1.0, sortino)
@@ -783,7 +910,20 @@ class ChinaBacktest:
         final_fitness = torch.median(sortino)
         mean_return = pnl.mean(dim=1).mean().item()
 
-        return final_fitness, mean_return
+        if not return_details:
+            return BacktestResult(score=final_fitness, mean_return=mean_return)
+
+        portfolio_ret = pnl.mean(dim=0)
+        equity_curve = torch.cumprod(torch.clamp(1.0 + portfolio_ret, min=1e-6), dim=0)
+        metrics = self._compute_risk_metrics(portfolio_ret, equity_curve, turnover, position)
+
+        return BacktestResult(
+            score=final_fitness,
+            mean_return=mean_return,
+            metrics=metrics,
+            equity_curve=equity_curve.detach().cpu(),
+            portfolio_returns=portfolio_ret.detach().cpu(),
+        )
 ```
 
 model_core/config.py
@@ -799,20 +939,42 @@ class ModelConfig:
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1024"))
     TRAIN_STEPS = int(os.getenv("TRAIN_STEPS", "400"))
     MAX_FORMULA_LEN = int(os.getenv("MAX_FORMULA_LEN", "8"))
-    INPUT_DIM = 5
+    INPUT_DIM = 58  # Updated for pandas_ta features
+    PPO_EPOCHS = int(os.getenv("PPO_EPOCHS", "4"))
+    PPO_CLIP_EPS = float(os.getenv("PPO_CLIP_EPS", "0.2"))
+    PPO_VALUE_COEF = float(os.getenv("PPO_VALUE_COEF", "0.5"))
+    PPO_ENTROPY_COEF = float(os.getenv("PPO_ENTROPY_COEF", "0.01"))
+    PPO_MAX_GRAD_NORM = float(os.getenv("PPO_MAX_GRAD_NORM", "1.0"))
 
     # China market settings
     COST_RATE = float(os.getenv("COST_RATE", "0.0005"))
+    SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0001"))
+    SLIPPAGE_IMPACT = float(os.getenv("SLIPPAGE_IMPACT", "0.0"))
     ALLOW_SHORT = os.getenv("ALLOW_SHORT", "0") == "1"
+    SIGNAL_LAG = int(os.getenv("CN_SIGNAL_LAG", "1"))
+    ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", "252"))
     STRATEGY_FILE = os.getenv("STRATEGY_FILE", "best_cn_strategy.json")
     CN_USE_MINUTE = os.getenv("CN_USE_MINUTE", "1") == "1"
     CN_MINUTE_DATA_ROOT = os.getenv("CN_MINUTE_DATA_ROOT", "data")
+    CN_USE_ADJ_FACTOR = os.getenv("CN_USE_ADJ_FACTOR", "1") == "1"
+    CN_ADJ_FACTOR_DIR = os.getenv("CN_ADJ_FACTOR_DIR", "复权因子")
     CN_MINUTE_START_DATE = os.getenv("CN_MINUTE_START_DATE", "")
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
     CN_EXIT_TIME = os.getenv("CN_EXIT_TIME", "15:00")
     CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "7"))
+    CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
+    CN_VAL_RATIO = float(os.getenv("CN_VAL_RATIO", "0.15"))
+    CN_TEST_RATIO = float(os.getenv("CN_TEST_RATIO", "0.15"))
+    CN_TRAIN_DAYS = int(os.getenv("CN_TRAIN_DAYS", "0"))
+    CN_VAL_DAYS = int(os.getenv("CN_VAL_DAYS", "0"))
+    CN_TEST_DAYS = int(os.getenv("CN_TEST_DAYS", "0"))
+    CN_WALK_FORWARD = os.getenv("CN_WALK_FORWARD", "0") == "1"
+    CN_WFO_TRAIN_DAYS = int(os.getenv("CN_WFO_TRAIN_DAYS", "60"))
+    CN_WFO_VAL_DAYS = int(os.getenv("CN_WFO_VAL_DAYS", "20"))
+    CN_WFO_TEST_DAYS = int(os.getenv("CN_WFO_TEST_DAYS", "20"))
+    CN_WFO_STEP_DAYS = int(os.getenv("CN_WFO_STEP_DAYS", "20"))
     _CN_CODES_RAW = os.getenv("CN_CODES", "")
     CN_CODES = [c.strip() for c in _CN_CODES_RAW.split(",") if c.strip()]
     _CN_MINUTE_YEARS_RAW = os.getenv("CN_MINUTE_YEARS", "")
@@ -823,6 +985,7 @@ class ModelConfig:
 
 model_core/data_loader.py
 ```python
+from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
@@ -832,6 +995,24 @@ import torch
 
 from .config import ModelConfig
 from .factors import FeatureEngineer
+
+
+@dataclass
+class DataSlice:
+    feat_tensor: torch.Tensor
+    raw_data_cache: dict[str, torch.Tensor]
+    target_ret: torch.Tensor
+    dates: pd.DatetimeIndex
+    symbols: list[str]
+    start_idx: int
+    end_idx: int
+
+
+@dataclass
+class WalkForwardFold:
+    train: DataSlice
+    val: DataSlice
+    test: DataSlice
 
 
 class ChinaMinuteDataLoader:
@@ -885,6 +1066,145 @@ class ChinaMinuteDataLoader:
                 break
         candidates = sorted(set(candidates))
         return candidates[:limit_codes] if limit_codes else candidates
+
+    def _read_adj_factor_csv(self, path: Path) -> pd.DataFrame:
+        encodings = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+        last_err: Optional[Exception] = None
+        for enc in encodings:
+            try:
+                return pd.read_csv(
+                    path,
+                    usecols=lambda c: c in {"date", "adj_factor", "code", "证券代码"},
+                    dtype={"date": "string"},
+                    encoding=enc,
+                )
+            except Exception as exc:
+                last_err = exc
+        if last_err:
+            raise last_err
+        return pd.DataFrame()
+
+    def _load_adj_factors(self, code: str) -> Optional[pd.DataFrame]:
+        if not ModelConfig.CN_USE_ADJ_FACTOR:
+            return None
+        path = self.data_root / ModelConfig.CN_ADJ_FACTOR_DIR / f"{code}.csv"
+        if not path.exists():
+            return None
+        try:
+            df = self._read_adj_factor_csv(path)
+        except Exception:
+            return None
+        if df.empty or "adj_factor" not in df.columns or "date" not in df.columns:
+            return None
+        df = df.loc[:, ["date", "adj_factor"]].copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df["date"] = df["date"].dt.normalize()
+        df["adj_factor"] = pd.to_numeric(df["adj_factor"], errors="coerce")
+        df = df.dropna(subset=["adj_factor"])
+        if df.empty:
+            return None
+        df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+        return df
+
+    def _apply_adj_factors(self, code: str, frame: pd.DataFrame) -> pd.DataFrame:
+        adj = self._load_adj_factors(code)
+        if adj is None or adj.empty:
+            frame["adj_factor"] = 1.0
+            return frame
+        merged = frame.merge(adj, on="date", how="left").sort_values("date")
+        merged["adj_factor"] = merged["adj_factor"].ffill().fillna(1.0)
+        for col in ("open", "high", "low", "close"):
+            merged[col] = merged[col].astype("float64") * merged["adj_factor"]
+        return merged
+
+    def _resolve_split_sizes(self, total_len: int) -> tuple[int, int, int]:
+        if total_len <= 0:
+            return 0, 0, 0
+        if ModelConfig.CN_TRAIN_DAYS or ModelConfig.CN_VAL_DAYS or ModelConfig.CN_TEST_DAYS:
+            train = max(0, ModelConfig.CN_TRAIN_DAYS)
+            val = max(0, ModelConfig.CN_VAL_DAYS)
+            test = max(0, ModelConfig.CN_TEST_DAYS)
+            if train + val + test == 0:
+                train = total_len
+            if train + val + test < total_len:
+                test += total_len - (train + val + test)
+            if train + val + test > total_len:
+                overflow = train + val + test - total_len
+                test = max(0, test - overflow)
+            if train + val + test > total_len:
+                overflow = train + val + test - total_len
+                val = max(0, val - overflow)
+            if train + val + test > total_len:
+                overflow = train + val + test - total_len
+                train = max(0, train - overflow)
+            return train, val, test
+        train = int(total_len * ModelConfig.CN_TRAIN_RATIO)
+        val = int(total_len * ModelConfig.CN_VAL_RATIO)
+        if train <= 0:
+            train = max(1, total_len - val)
+        if train + val > total_len:
+            val = max(0, total_len - train)
+        test = max(0, total_len - train - val)
+        return train, val, test
+
+    def _slice_raw_data(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        if self.raw_data_cache is None:
+            raise ValueError("raw_data_cache is empty. Call load_data() first.")
+        return {k: v[:, start:end] for k, v in self.raw_data_cache.items()}
+
+    def get_slice(self, start: int, end: int) -> DataSlice:
+        if self.feat_tensor is None or self.target_ret is None or self.dates is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        start = max(0, start)
+        end = max(start, min(end, self.feat_tensor.shape[2]))
+        return DataSlice(
+            feat_tensor=self.feat_tensor[:, :, start:end],
+            raw_data_cache=self._slice_raw_data(start, end),
+            target_ret=self.target_ret[:, start:end],
+            dates=self.dates[start:end],
+            symbols=self.symbols or [],
+            start_idx=start,
+            end_idx=end,
+        )
+
+    def train_val_test_split(self) -> dict[str, DataSlice]:
+        if self.dates is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        total_len = len(self.dates)
+        train_len, val_len, test_len = self._resolve_split_sizes(total_len)
+        splits: dict[str, DataSlice] = {}
+        cursor = 0
+        if train_len > 0:
+            splits["train"] = self.get_slice(cursor, cursor + train_len)
+            cursor += train_len
+        if val_len > 0:
+            splits["val"] = self.get_slice(cursor, cursor + val_len)
+            cursor += val_len
+        if test_len > 0:
+            splits["test"] = self.get_slice(cursor, cursor + test_len)
+        return splits
+
+    def walk_forward_splits(self) -> list[WalkForwardFold]:
+        if self.dates is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        total_len = len(self.dates)
+        train_len = max(0, ModelConfig.CN_WFO_TRAIN_DAYS)
+        val_len = max(0, ModelConfig.CN_WFO_VAL_DAYS)
+        test_len = max(0, ModelConfig.CN_WFO_TEST_DAYS)
+        step_len = max(1, ModelConfig.CN_WFO_STEP_DAYS)
+        window = train_len + val_len + test_len
+        if window <= 0 or total_len < window:
+            return []
+        folds: list[WalkForwardFold] = []
+        start = 0
+        while start + window <= total_len:
+            train_slice = self.get_slice(start, start + train_len)
+            val_slice = self.get_slice(start + train_len, start + train_len + val_len)
+            test_slice = self.get_slice(start + train_len + val_len, start + window)
+            folds.append(WalkForwardFold(train=train_slice, val=val_slice, test=test_slice))
+            start += step_len
+        return folds
 
     def load_data(
         self,
@@ -968,6 +1288,8 @@ class ChinaMinuteDataLoader:
             if records:
                 frame = pd.DataFrame(records)
                 frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+                if ModelConfig.CN_USE_ADJ_FACTOR:
+                    frame = self._apply_adj_factors(code, frame)
                 per_code_frames[code] = frame
 
         if not per_code_frames:
@@ -997,6 +1319,7 @@ class ChinaMinuteDataLoader:
         volume_df = build_pivot("volume")
         amount_df = build_pivot("amount")
         target_df = build_pivot("target_ret")
+        adj_df = build_pivot("adj_factor") if ModelConfig.CN_USE_ADJ_FACTOR else None
 
         index = close_df.index
         columns = close_df.columns
@@ -1015,6 +1338,8 @@ class ChinaMinuteDataLoader:
             "liquidity": to_tensor(amount_df),
             "fdv": to_tensor(amount_df),
         }
+        if adj_df is not None:
+            self.raw_data_cache["adj_factor"] = to_tensor(adj_df)
 
         self.feat_tensor = FeatureEngineer.compute_features(self.raw_data_cache)
         self.target_ret = to_tensor(target_df)
@@ -1030,6 +1355,7 @@ from typing import Optional, Any
 import json
 
 import torch
+import torch.nn.functional as F
 from torch.distributions import Categorical
 from tqdm import tqdm
 
@@ -1072,7 +1398,7 @@ class AlphaEngine:
             )
             self.rank_monitor: Optional[StableRankMonitor] = StableRankMonitor(
                 self.model,
-                target_keywords=["q_proj", "k_proj"],
+                target_keywords=["attention", "in_proj", "out_proj"],
             )
         else:
             self.lord_opt = None
@@ -1080,6 +1406,17 @@ class AlphaEngine:
 
         self.vm = StackVM()
         self.bt = ChinaBacktest()
+        self.feat_offset = self.vm.feat_offset
+        self.vocab_size = self.model.vocab_size
+        self.token_arity = self._build_token_arity().to(ModelConfig.DEVICE)
+        self.token_delta = self._build_token_delta().to(ModelConfig.DEVICE)
+
+        self.splits = self.loader.train_val_test_split()
+        self.train_slice = self.splits.get("train")
+        self.val_slice = self.splits.get("val")
+        self.test_slice = self.splits.get("test")
+        self.walk_forward_folds = self.loader.walk_forward_splits() if ModelConfig.CN_WALK_FORWARD else []
+        self.use_wfo = ModelConfig.CN_WALK_FORWARD and len(self.walk_forward_folds) > 0
 
         self.best_score: float = -float('inf')
         self.best_formula: Optional[list[int]] = None
@@ -1089,40 +1426,99 @@ class AlphaEngine:
             'avg_reward': [],
             'best_score': [],
             'stable_rank': [],
+            'avg_val_score': [],
+            'policy_loss': [],
+            'value_loss': [],
+            'entropy': [],
         }
 
+    def _build_token_arity(self) -> torch.Tensor:
+        token_arity = torch.zeros(self.vocab_size, dtype=torch.long)
+        # Default to "always legal" for feature tokens.
+        token_arity[: self.feat_offset] = 0
+        # Fill operator arity from VM definition.
+        for token, arity in self.vm.arity_map.items():
+            if 0 <= token < self.vocab_size:
+                token_arity[token] = int(arity)
+        return token_arity
+
+    def _build_token_delta(self) -> torch.Tensor:
+        # Feature token pushes one tensor onto stack.
+        token_delta = torch.ones(self.vocab_size, dtype=torch.long)
+        # Operator pops `arity`, then pushes one result => delta = 1 - arity.
+        for token, arity in self.vm.arity_map.items():
+            if 0 <= token < self.vocab_size:
+                token_delta[token] = 1 - int(arity)
+        return token_delta
+
+    def _legal_action_mask(self, stack_depth: torch.Tensor, remaining_steps: int) -> torch.Tensor:
+        # A token is legal iff current depth >= token arity (no underflow).
+        legal = stack_depth.unsqueeze(1) >= self.token_arity.unsqueeze(0)
+        next_depth = stack_depth.unsqueeze(1) + self.token_delta.unsqueeze(0)
+        # Keep only actions that can still finish with stack depth 1.
+        if remaining_steps > 1:
+            legal = legal & (next_depth <= remaining_steps)
+        else:
+            legal = legal & (next_depth == 1)
+        return legal
+
     def train(self) -> None:
-        print("🚀 Starting Alpha Mining with LoRD Regularization..." if self.use_lord else "🚀 Starting Alpha Mining...")
+        print("🚀 Starting Alpha Mining with PPO + LoRD..." if self.use_lord else "🚀 Starting Alpha Mining with PPO...")
         if self.use_lord:
             print("   LoRD Regularization enabled")
             print("   Target keywords: ['q_proj', 'k_proj', 'attention', 'qk_norm']")
+        if self.use_wfo:
+            print(f"   Walk-forward validation: {len(self.walk_forward_folds)} folds")
+        elif self.train_slice:
+            print(f"   Train window: {self.train_slice.dates.min()} -> {self.train_slice.dates.max()}")
+            if self.val_slice:
+                print(f"   Val window:   {self.val_slice.dates.min()} -> {self.val_slice.dates.max()}")
+            if self.test_slice:
+                print(f"   Test window:  {self.test_slice.dates.min()} -> {self.test_slice.dates.max()}")
 
         pbar = tqdm(range(ModelConfig.TRAIN_STEPS))
+        full_feat = self.loader.feat_tensor
+        if full_feat is None or self.loader.raw_data_cache is None or self.loader.target_ret is None:
+            raise ValueError("Data not loaded. Check data loader.")
 
         for step in pbar:
             bs = ModelConfig.BATCH_SIZE
             inp = torch.zeros((bs, 1), dtype=torch.long, device=ModelConfig.DEVICE)
+            stack_depth = torch.zeros(bs, dtype=torch.long, device=ModelConfig.DEVICE)
 
-            log_probs: list[torch.Tensor] = []
+            old_log_probs: list[torch.Tensor] = []
             tokens_list: list[torch.Tensor] = []
+            stack_depth_steps: list[torch.Tensor] = []
 
-            for _ in range(ModelConfig.MAX_FORMULA_LEN):
+            for t in range(ModelConfig.MAX_FORMULA_LEN):
                 logits, _, _ = self.model(inp)
-                dist = Categorical(logits=logits)
+                stack_depth_steps.append(stack_depth.clone())
+                remaining_steps = ModelConfig.MAX_FORMULA_LEN - t
+                legal_mask = self._legal_action_mask(stack_depth, remaining_steps)
+                masked_logits = logits.masked_fill(~legal_mask, -1e9)
+                dist = Categorical(logits=masked_logits)
                 action = dist.sample()
 
-                log_probs.append(dist.log_prob(action))
+                old_log_probs.append(dist.log_prob(action).detach())
                 tokens_list.append(action)
+                stack_depth = stack_depth + self.token_delta[action]
                 inp = torch.cat([inp, action.unsqueeze(1)], dim=1)
 
             seqs = torch.stack(tokens_list, dim=1)
+            rollout_inputs = inp.detach()
+            old_log_probs_tensor = torch.stack(old_log_probs, dim=1).detach()
+
+            with torch.no_grad():
+                _, old_values, _ = self.model(rollout_inputs)
+                old_values = old_values.squeeze(-1).detach()
 
             rewards = torch.zeros(bs, device=ModelConfig.DEVICE)
+            val_scores: list[float] = []
 
             for i in range(bs):
                 formula = seqs[i].tolist()
 
-                res = self.vm.execute(formula, self.loader.feat_tensor)
+                res = self.vm.execute(formula, full_feat)
                 if res is None:
                     rewards[i] = -5.0
                     continue
@@ -1131,40 +1527,143 @@ class AlphaEngine:
                     rewards[i] = -2.0
                     continue
 
-                score, ret_val = self.bt.evaluate(res, self.loader.raw_data_cache, self.loader.target_ret)
-                rewards[i] = score
+                ret_val = 0.0
+                selection_score = None
 
-                if score.item() > self.best_score:
-                    self.best_score = score.item()
+                if self.use_wfo:
+                    fold_scores = []
+                    fold_returns = []
+                    for fold in self.walk_forward_folds:
+                        if fold.val.end_idx <= fold.val.start_idx:
+                            continue
+                        res_val = res[:, fold.val.start_idx:fold.val.end_idx]
+                        if res_val.numel() == 0:
+                            continue
+                        result = self.bt.evaluate(res_val, fold.val.raw_data_cache, fold.val.target_ret)
+                        fold_scores.append(result.score)
+                        fold_returns.append(result.mean_return)
+                    if not fold_scores:
+                        rewards[i] = -2.0
+                        continue
+                    reward = torch.stack(fold_scores).mean()
+                    rewards[i] = reward
+                    selection_score = reward
+                    ret_val = float(sum(fold_returns) / len(fold_returns))
+                else:
+                    train_slice = self.train_slice
+                    if train_slice is None:
+                        train_slice = self.loader.get_slice(0, res.shape[1])
+                    res_train = res[:, train_slice.start_idx:train_slice.end_idx]
+                    if res_train.std() < 1e-4:
+                        rewards[i] = -2.0
+                        continue
+                    train_result = self.bt.evaluate(
+                        res_train,
+                        train_slice.raw_data_cache,
+                        train_slice.target_ret,
+                    )
+                    rewards[i] = train_result.score
+                    selection_score = train_result.score
+                    ret_val = train_result.mean_return
+
+                    if self.val_slice and self.val_slice.end_idx > self.val_slice.start_idx:
+                        res_val = res[:, self.val_slice.start_idx:self.val_slice.end_idx]
+                        if res_val.numel() > 0:
+                            val_result = self.bt.evaluate(
+                                res_val,
+                                self.val_slice.raw_data_cache,
+                                self.val_slice.target_ret,
+                            )
+                            selection_score = val_result.score
+                            ret_val = val_result.mean_return
+                            val_scores.append(val_result.score.item())
+
+                if selection_score is not None and selection_score.item() > self.best_score:
+                    self.best_score = selection_score.item()
                     self.best_formula = formula
-                    tqdm.write(f"[!] New King: Score {score:.2f} | Ret {ret_val:.2%} | Formula {formula}")
+                    tqdm.write(f"[!] New King: Score {selection_score:.2f} | Ret {ret_val:.2%} | Formula {formula}")
 
-            adv = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
+            returns = torch.nan_to_num(rewards.detach(), nan=-2.0, posinf=5.0, neginf=-5.0)
+            advantages = returns - old_values
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-5)
 
-            loss = torch.tensor(0.0, device=ModelConfig.DEVICE)
-            for t in range(len(log_probs)):
-                loss = loss + (-log_probs[t] * adv)
+            policy_loss_value = float("nan")
+            value_loss_value = float("nan")
+            entropy_value = float("nan")
 
-            loss = loss.mean()
+            for _ in range(max(1, ModelConfig.PPO_EPOCHS)):
+                new_log_probs_steps: list[torch.Tensor] = []
+                entropy_steps: list[torch.Tensor] = []
 
-            self.opt.zero_grad()
-            loss.backward()
-            self.opt.step()
+                for t in range(ModelConfig.MAX_FORMULA_LEN):
+                    prefix = rollout_inputs[:, : t + 1]
+                    logits_t, _, _ = self.model(prefix)
+                    remaining_steps = ModelConfig.MAX_FORMULA_LEN - t
+                    legal_mask_t = self._legal_action_mask(stack_depth_steps[t], remaining_steps)
+                    masked_logits_t = logits_t.masked_fill(~legal_mask_t, -1e9)
+                    dist_t = Categorical(logits=masked_logits_t)
+                    actions_t = seqs[:, t]
+                    new_log_probs_steps.append(dist_t.log_prob(actions_t))
+                    entropy_steps.append(dist_t.entropy())
 
-            if self.use_lord and self.lord_opt:
-                self.lord_opt.step()
+                new_log_probs = torch.stack(new_log_probs_steps, dim=1)
+                ratio = torch.exp(new_log_probs - old_log_probs_tensor)
+
+                adv_expand = advantages.unsqueeze(1)
+                surr1 = ratio * adv_expand
+                surr2 = torch.clamp(
+                    ratio,
+                    1.0 - ModelConfig.PPO_CLIP_EPS,
+                    1.0 + ModelConfig.PPO_CLIP_EPS,
+                ) * adv_expand
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                _, values_pred, _ = self.model(rollout_inputs)
+                values_pred = values_pred.squeeze(-1)
+                value_loss = F.mse_loss(values_pred, returns)
+
+                entropy_bonus = torch.stack(entropy_steps, dim=1).mean()
+                loss = (
+                    policy_loss
+                    + ModelConfig.PPO_VALUE_COEF * value_loss
+                    - ModelConfig.PPO_ENTROPY_COEF * entropy_bonus
+                )
+
+                self.opt.zero_grad()
+                loss.backward()
+                if ModelConfig.PPO_MAX_GRAD_NORM > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), ModelConfig.PPO_MAX_GRAD_NORM)
+                self.opt.step()
+
+                if self.use_lord and self.lord_opt:
+                    self.lord_opt.step()
+
+                policy_loss_value = policy_loss.item()
+                value_loss_value = value_loss.item()
+                entropy_value = entropy_bonus.item()
 
             avg_reward = rewards.mean().item()
             postfix_dict = {'AvgRew': f"{avg_reward:.3f}", 'BestScore': f"{self.best_score:.3f}"}
+            postfix_dict['PLoss'] = f"{policy_loss_value:.3f}"
+            postfix_dict['VLoss'] = f"{value_loss_value:.3f}"
 
             if self.use_lord and self.rank_monitor and step % 100 == 0:
                 stable_rank = self.rank_monitor.compute()
                 postfix_dict['Rank'] = f"{stable_rank:.2f}"
                 self.training_history['stable_rank'].append(stable_rank)
+            if val_scores:
+                avg_val = float(sum(val_scores) / len(val_scores))
+                postfix_dict['Val'] = f"{avg_val:.3f}"
+                self.training_history['avg_val_score'].append(avg_val)
+            else:
+                self.training_history['avg_val_score'].append(float("nan"))
 
             self.training_history['step'].append(step)
             self.training_history['avg_reward'].append(avg_reward)
             self.training_history['best_score'].append(self.best_score)
+            self.training_history['policy_loss'].append(policy_loss_value)
+            self.training_history['value_loss'].append(value_loss_value)
+            self.training_history['entropy'].append(entropy_value)
 
             pbar.set_postfix(postfix_dict)
 
@@ -1177,64 +1676,343 @@ class AlphaEngine:
         print("\n✓ Training completed!")
         print(f"  Best score: {self.best_score:.4f}")
         print(f"  Best formula: {self.best_formula}")
+
+        if self.best_formula and not self.use_wfo:
+            res = self.vm.execute(self.best_formula, full_feat)
+            if res is not None:
+                def _print_eval(label: str, result) -> None:
+                    metrics = result.metrics or {}
+                    sharpe = metrics.get("sharpe", float("nan"))
+                    max_dd = metrics.get("max_drawdown", float("nan"))
+                    print(f"  {label}: Score {result.score.item():.4f} | MeanRet {result.mean_return:.2%} | Sharpe {sharpe:.2f} | MaxDD {max_dd:.2%}")
+
+                if self.train_slice:
+                    train_res = res[:, self.train_slice.start_idx:self.train_slice.end_idx]
+                    train_result = self.bt.evaluate(
+                        train_res,
+                        self.train_slice.raw_data_cache,
+                        self.train_slice.target_ret,
+                        return_details=True,
+                    )
+                    _print_eval("Train", train_result)
+                if self.val_slice:
+                    val_res = res[:, self.val_slice.start_idx:self.val_slice.end_idx]
+                    val_result = self.bt.evaluate(
+                        val_res,
+                        self.val_slice.raw_data_cache,
+                        self.val_slice.target_ret,
+                        return_details=True,
+                    )
+                    _print_eval("Val", val_result)
+                if self.test_slice:
+                    test_res = res[:, self.test_slice.start_idx:self.test_slice.end_idx]
+                    test_result = self.bt.evaluate(
+                        test_res,
+                        self.test_slice.raw_data_cache,
+                        self.test_slice.target_ret,
+                        return_details=True,
+                    )
+                    _print_eval("Test", test_result)
 ```
 
 model_core/factors.py
 ```python
 import torch
-
+import pandas as pd
+import pandas_ta as ta
 
 class FeatureEngineer:
-    """Feature engineer for China A-share/ETF data."""
-
-    FEATURES = ['RET', 'RET5', 'VOL_CHG', 'V_RET', 'TREND']
+    """Feature engineer for China A-share/ETF data using pandas_ta."""
+    
+    # 58 Features
+    FEATURES = [
+        # Price Transform
+        'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME', 'AMOUNT',
+        'AVGPRICE', 'MEDPRICE', 'TYPPRICE', 'WCLOSE',
+        
+        # Returns & Volatility
+        'RET', 'RET5', 'RET10', 'RET20',
+        'LOG_RET',
+        'TR', 'ATR14', 'NATR14',
+        
+        # Momentum
+        'RSI14', 'RSI24',
+        'MACD', 'MACDh', 'MACDs',
+        'BOP', 'CCI14', 'CMO14',
+        'KDJ_K', 'KDJ_D', 'KDJ_J',
+        'MOM10', 'ROC10', 'PPO', 'PPOh', 'PPOs',
+        'TSI', 'UO', 'WILLR',
+        
+        # Overlap / Trend
+        'SMA5', 'SMA10', 'SMA20', 'SMA60',
+        'EMA5', 'EMA10', 'EMA20', 'EMA60',
+        'TEMA10', 
+        'BB_UPPER', 'BB_MID', 'BB_LOWER', 'BB_WIDTH',
+        'MIDPOINT', 'MIDPRICE',
+        'SAR',
+        
+        # Volume
+        'OBV', 'AD', 'ADOSC', 'CMF', 'MFI14', 
+        'V_RET', 'VOL_MA5', 'VOL_MA20'
+    ]
+    
     INPUT_DIM = len(FEATURES)
 
     @staticmethod
-    def _ts_mean(x: torch.Tensor, window: int) -> torch.Tensor:
-        if window <= 1:
-            return x
-        pad = torch.zeros((x.shape[0], window - 1), device=x.device)
-        x_pad = torch.cat([pad, x], dim=1)
-        windows = x_pad.unfold(1, window, 1)
-        return windows.mean(dim=-1)
+    def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
+        """Robust Z-Score Normalization (Cross-Sectional or Time-Series)."""
+        # Here we normalize across time per asset (Time-Series Z-Score) as per original logic,
+        # but robust to outliers using Median and MAD.
+        # t: [Batch, Time]
+        median = torch.nanmedian(t, dim=1, keepdim=True)[0]
+        mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
+        norm = (t - median) / mad
+        return torch.clamp(norm, -clip, clip)
 
     @staticmethod
     def compute_features(raw_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute 5 basic features aligned with A-share bars."""
-        c = raw_dict['close']
-        v = raw_dict['volume']
+        """
+        Compute features using pandas_ta.
+        
+        Args:
+            raw_dict: Dictionary of raw tensors [Batch, Time].
+                      Keys: open, high, low, close, volume, amount
+        
+        Returns:
+            features: [Batch, N_Features, Time]
+        """
+        device = raw_dict['close'].device
+        dtype = raw_dict['close'].dtype
+        
+        # Helper to convert Tensor to DataFrame (for pandas_ta)
+        def to_df(key):
+            t = raw_dict[key].detach().cpu().numpy()
+            return pd.DataFrame(t.T) # [Time, Batch] as columns
 
-        prev_close = torch.roll(c, 1, dims=1)
-        ret = (c - prev_close) / (prev_close + 1e-6)
-        ret[:, 0] = 0.0
+        # We must process each asset (column) individually or use pandas_ta machinery?
+        # AShareGPT handles batch of assets (N Symbols).
+        # pandas_ta is designed for single DataFrame (Time, OHLCV).
+        # To be efficient, we iterate over pandas_ta functions, not assets.
+        # But pandas_ta functions usually take Series. We can apply them to the whole DataFrame if structure permits,
+        # but mostly they expect single Series.
+        # Given "Batch" dimension is usually Symbols (e.g. 50), looping 50 times is fast enough.
+        
+        # Convert raw tensors to numpy for pandas processing
+        # Structure: [Batch, Time] -> [Time, Batch] for DataFrame
+        eps = 1e-8
+        
+        opens = raw_dict['open'].detach().cpu().float().numpy().T
+        highs = raw_dict['high'].detach().cpu().float().numpy().T
+        lows = raw_dict['low'].detach().cpu().float().numpy().T
+        closes = raw_dict['close'].detach().cpu().numpy().T
+        volumes = raw_dict['volume'].detach().cpu().float().numpy().T
+        amounts = raw_dict['amount'].detach().cpu().float().numpy().T
+        
+        n_time, n_assets = closes.shape
+        n_features = len(FeatureEngineer.FEATURES)
+        
+        # Pre-allocate output feature array [n_assets, n_features, n_time]
+        feat_out = torch.zeros((n_assets, n_features, n_time), dtype=dtype, device=device)
+        
+        # We prefer to use pandas_ta Strategy for speed if possible, but 
+        # looping over assets is safer for correctness with pandas_ta's structure.
+        
+        CustomStrategy = ta.Strategy(
+            name="AlphaGPT Strategy",
+            ta=[
+                # Price Transform
+                {"kind": "avgprice"},
+                {"kind": "medprice"},
+                {"kind": "typprice"},
+                {"kind": "wclose"}, # requires OHLC
+                
+                # Returns
+                {"kind": "log_return", "cumulative": False},
+                {"kind": "percent_return", "length": 1},
+                {"kind": "percent_return", "length": 5},
+                {"kind": "percent_return", "length": 10},
+                {"kind": "percent_return", "length": 20},
+                
+                # Volatility
+                {"kind": "true_range"},
+                {"kind": "atr", "length": 14},
+                {"kind": "natr", "length": 14},
+                
+                # Momentum
+                {"kind": "rsi", "length": 14},
+                {"kind": "rsi", "length": 24},
+                {"kind": "macd"},
+                {"kind": "bop"},
+                {"kind": "cci", "length": 14},
+                {"kind": "cmo", "length": 14},
+                {"kind": "kdj"},
+                {"kind": "mom", "length": 10},
+                {"kind": "roc", "length": 10},
+                {"kind": "ppo"},
+                {"kind": "tsi"},
+                {"kind": "uo"},
+                {"kind": "willr"},
+                
+                # Overlap
+                {"kind": "sma", "length": 5},
+                {"kind": "sma", "length": 10},
+                {"kind": "sma", "length": 20},
+                {"kind": "sma", "length": 60},
+                {"kind": "ema", "length": 5},
+                {"kind": "ema", "length": 10},
+                {"kind": "ema", "length": 20},
+                {"kind": "ema", "length": 60},
+                {"kind": "tema", "length": 10},
+                {"kind": "bbands", "length": 20},
+                {"kind": "midpoint"},
+                {"kind": "midprice"},
+                {"kind": "sar"},
+                
+                # Volume
+                {"kind": "obv"},
+                {"kind": "ad"},
+                {"kind": "adosc"},
+                {"kind": "cmf"},
+                {"kind": "mfi", "length": 14},
+            ]
+        )
+        
+        # Iterate over each asset
+        for i in range(n_assets):
+            df = pd.DataFrame({
+                'open': opens[:, i],
+                'high': highs[:, i],
+                'low': lows[:, i],
+                'close': closes[:, i],
+                'volume': volumes[:, i],
+            })
+            # Handle zeros in volume to avoid div by zero in some indicators
+            df['volume'] = df['volume'].replace(0, 1e-4)
+            
+            # Run Strategy
+            df.ta.strategy(CustomStrategy)
+            
+            # --- Map implementation output columns to FEATURES list ---
+            # pandas_ta auto-names columns like "RSI_14", "MACD_12_26_9", etc.
+            # We need to map them rigorously.
+            
+            # Helper to safely get col
+            def get_col(name_patterns):
+                # patterns: list of possible names, e.g. ["RSI_14", "RSI"]
+                for pat in name_patterns:
+                    if pat in df.columns:
+                        return df[pat].values
+                # Prefix search
+                for col in df.columns:
+                    for pat in name_patterns:
+                        if col.startswith(pat):
+                            return df[col].values
+                return df['close'].values * 0 # Fallback
+            
+            # 1. Base Prices
+            feat_dict = {}
+            feat_dict['OPEN'] = df['open'].values
+            feat_dict['HIGH'] = df['high'].values
+            feat_dict['LOW'] = df['low'].values
+            feat_dict['CLOSE'] = df['close'].values
+            feat_dict['VOLUME'] = df['volume'].values
+            feat_dict['AMOUNT'] = amounts[:, i] # Raw passed through
+            
+            # 2. Transformed Prices
+            feat_dict['AVGPRICE'] = get_col(["AVGPRICE"])
+            feat_dict['MEDPRICE'] = get_col(["MEDPRICE"])
+            feat_dict['TYPPRICE'] = get_col(["TYPPRICE"])
+            feat_dict['WCLOSE'] = get_col(["HLC3", "WCP"]) 
+            
+            # 3. Returns
+            feat_dict['RET'] = get_col(["PCTRET_1"])
+            feat_dict['RET5'] = get_col(["PCTRET_5"])
+            feat_dict['RET10'] = get_col(["PCTRET_10"])
+            feat_dict['RET20'] = get_col(["PCTRET_20"])
+            feat_dict['LOG_RET'] = get_col(["LOGRET_1"])
+            
+            # 4. Volatility
+            feat_dict['TR'] = get_col(["TR", "TRUERANGE"])
+            feat_dict['ATR14'] = get_col(["ATR_14"])
+            feat_dict['NATR14'] = get_col(["NATR_14"])
+            
+            # 5. Momentum
+            feat_dict['RSI14'] = get_col(["RSI_14"])
+            feat_dict['RSI24'] = get_col(["RSI_24"])
+            feat_dict['MACD'] = get_col(["MACD_12_26_9"])
+            feat_dict['MACDh'] = get_col(["MACDh_12_26_9"])
+            feat_dict['MACDs'] = get_col(["MACDs_12_26_9"])
+            feat_dict['BOP'] = get_col(["BOP"])
+            feat_dict['CCI14'] = get_col(["CCI_14_0.015"])
+            feat_dict['CMO14'] = get_col(["CMO_14"])
+            feat_dict['KDJ_K'] = get_col(["K_9_3"])
+            feat_dict['KDJ_D'] = get_col(["D_9_3"])
+            feat_dict['KDJ_J'] = get_col(["J_9_3"])
+            feat_dict['MOM10'] = get_col(["MOM_10"])
+            feat_dict['ROC10'] = get_col(["ROC_10"])
+            feat_dict['PPO'] = get_col(["PPO_12_26_9"])
+            feat_dict['PPOh'] = get_col(["PPOh_12_26_9"])
+            feat_dict['PPOs'] = get_col(["PPOs_12_26_9"])
+            feat_dict['TSI'] = get_col(["TSI_13_25_13"])
+            feat_dict['UO'] = get_col(["UO_7_14_28"])
+            feat_dict['WILLR'] = get_col(["WILLR_14"])
+            
+            # 6. Overlap
+            feat_dict['SMA5'] = get_col(["SMA_5"])
+            feat_dict['SMA10'] = get_col(["SMA_10"])
+            feat_dict['SMA20'] = get_col(["SMA_20"])
+            feat_dict['SMA60'] = get_col(["SMA_60"])
+            feat_dict['EMA5'] = get_col(["EMA_5"])
+            feat_dict['EMA10'] = get_col(["EMA_10"])
+            feat_dict['EMA20'] = get_col(["EMA_20"])
+            feat_dict['EMA60'] = get_col(["EMA_60"])
+            feat_dict['TEMA10'] = get_col(["TEMA_10"])
+            
+            feat_dict['BB_UPPER'] = get_col(["BBU_5_2.0", "BBU_20_2.0"])
+            feat_dict['BB_MID'] = get_col(["BBM_5_2.0", "BBM_20_2.0"])
+            feat_dict['BB_LOWER'] = get_col(["BBL_5_2.0", "BBL_20_2.0"])
+            feat_dict['BB_WIDTH'] = get_col(["BBB_5_2.0", "BBB_20_2.0"])
+            
+            feat_dict['MIDPOINT'] = get_col(["MIDPOINT_2"])
+            feat_dict['MIDPRICE'] = get_col(["MIDPRICE_2"])
+            feat_dict['SAR'] = get_col(["SAR"])
+            
+            # 7. Volume
+            feat_dict['OBV'] = get_col(["OBV"])
+            feat_dict['AD'] = get_col(["AD"])
+            feat_dict['ADOSC'] = get_col(["ADOSC_3_10"])
+            feat_dict['CMF'] = get_col(["CMF_20"])
+            feat_dict['MFI14'] = get_col(["MFI_14"])
+            
+            # custom volume features not in pandas_ta strategy explicitly or need custom calc
+            # V_RET
+            v_curr = df['volume'].values
+            v_prev = pd.Series(v_curr).shift(1).fillna(method='bfill').values
+            feat_dict['V_RET'] = (v_curr / (v_prev + 1e-6)) - 1.0
+            
+            # VOL MA
+            feat_dict['VOL_MA5'] = pd.Series(df['volume']).rolling(5).mean().fillna(0).values
+            feat_dict['VOL_MA20'] = pd.Series(df['volume']).rolling(20).mean().fillna(0).values
+            
+            # Fill tensor
+            for f_idx, name in enumerate(FeatureEngineer.FEATURES):
+                val = feat_dict.get(name, None)
+                if val is None:
+                    # Fallback for missing mapping
+                    pass 
+                else:
+                    # Fill
+                    feat_out[i, f_idx, :] = torch.from_numpy(val).to(device)
 
-        c5 = torch.roll(c, 5, dims=1)
-        ret5 = (c - c5) / (c5 + 1e-6)
-        ret5[:, :5] = 0.0
-
-        vol_ma20 = FeatureEngineer._ts_mean(v, 20)
-        vol_chg = torch.where(vol_ma20 > 0, v / (vol_ma20 + 1e-6) - 1.0, torch.zeros_like(v))
-        v_ret = ret * (vol_chg + 1.0)
-
-        ma60 = FeatureEngineer._ts_mean(c, 60)
-        trend = torch.where(ma60 > 0, c / (ma60 + 1e-6) - 1.0, torch.zeros_like(c))
-
-        def robust_norm(t):
-            median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-            mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
-            norm = (t - median) / mad
-            return torch.clamp(norm, -5.0, 5.0)
-
-        features = torch.stack([
-            robust_norm(ret),
-            robust_norm(ret5),
-            robust_norm(vol_chg),
-            robust_norm(v_ret),
-            robust_norm(trend)
-        ], dim=1)
-
-        return features
+        # Post-process: NaN handling & Normalization
+        feat_out = torch.nan_to_num(feat_out, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Apply Robust Normalization to everything?
+        # Yes, AlphaGPT expects roughly standard normal inputs.
+        # But we do this across Time per Asset (Time-Series Norm)
+        normalized = FeatureEngineer.robust_norm(feat_out)
+        
+        return normalized
 ```
 
 model_core/ops.py
@@ -1396,7 +2174,9 @@ import os
 import sys
 import json
 import argparse
+from pathlib import Path
 
+import pandas as pd
 import torch
 
 from model_core.config import ModelConfig
@@ -1410,7 +2190,48 @@ def load_strategy(filepath: str) -> list:
         return json.load(f)
 
 
-def run_backtest(formula: list, symbols: list | None = None):
+def _format_pct(value: float) -> str:
+    return f"{value:.2%}"
+
+
+def print_metrics(title: str, result) -> None:
+    print("\n" + "-" * 60)
+    print(title)
+    print("-" * 60)
+    print(f"Sortino Score: {result.score.item():.4f}")
+    print(f"Mean Return: {result.mean_return:.4%}")
+    if not result.metrics:
+        return
+    m = result.metrics
+    print(f"CAGR: {_format_pct(m['cagr'])} | Annual Vol: {_format_pct(m['annual_vol'])} | Sharpe: {m['sharpe']:.2f}")
+    print(f"Max Drawdown: {_format_pct(m['max_drawdown'])} | Calmar: {m['calmar']:.2f} | Win Rate: {_format_pct(m['win_rate'])}")
+    print(f"Profit Factor: {m['profit_factor']:.2f} | Expectancy: {_format_pct(m['expectancy'])}")
+    print(f"Avg Turnover: {_format_pct(m['avg_turnover'])} | Long: {_format_pct(m['long_ratio'])} | Short: {_format_pct(m['short_ratio'])} | Flat: {_format_pct(m['flat_ratio'])}")
+
+
+def save_equity_curve(path: str, dates, result) -> None:
+    if result.equity_curve is None or result.portfolio_returns is None:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(
+        {
+            "date": dates.astype("datetime64[ns]"),
+            "equity": result.equity_curve.numpy(),
+            "return": result.portfolio_returns.numpy(),
+        }
+    )
+    df.to_csv(out_path, index=False)
+    print(f"📈 Equity curve saved: {out_path}")
+
+
+def run_backtest(
+    formula: list,
+    symbols: list | None = None,
+    split: bool = False,
+    walk_forward: bool = False,
+    curve_out: str | None = None,
+):
     print("Loading minute CSV data...")
     loader = ChinaMinuteDataLoader()
     loader.load_data(
@@ -1440,39 +2261,81 @@ def run_backtest(formula: list, symbols: list | None = None):
 
     print("\nRunning backtest...")
     bt = ChinaBacktest()
-    score, mean_ret = bt.evaluate(
-        factors.unsqueeze(0),
+
+    if walk_forward:
+        folds = loader.walk_forward_splits()
+        if not folds:
+            print("⚠️  Walk-forward disabled: not enough data for configured windows.")
+        else:
+            val_scores = []
+            test_scores = []
+            for idx, fold in enumerate(folds, 1):
+                if fold.val.end_idx > fold.val.start_idx:
+                    res_val = factors[:, fold.val.start_idx:fold.val.end_idx]
+                    val_result = bt.evaluate(
+                        res_val,
+                        fold.val.raw_data_cache,
+                        fold.val.target_ret,
+                        return_details=True,
+                    )
+                    print_metrics(f"Fold {idx} - Validation", val_result)
+                    val_scores.append(val_result.score.item())
+                if fold.test.end_idx > fold.test.start_idx:
+                    res_test = factors[:, fold.test.start_idx:fold.test.end_idx]
+                    test_result = bt.evaluate(
+                        res_test,
+                        fold.test.raw_data_cache,
+                        fold.test.target_ret,
+                        return_details=True,
+                    )
+                    print_metrics(f"Fold {idx} - Test", test_result)
+                    test_scores.append(test_result.score.item())
+            if val_scores:
+                print(f"\nWalk-forward Avg Val Score: {sum(val_scores) / len(val_scores):.4f}")
+            if test_scores:
+                print(f"Walk-forward Avg Test Score: {sum(test_scores) / len(test_scores):.4f}")
+        return None
+
+    if split:
+        splits = loader.train_val_test_split()
+        for name in ("train", "val", "test"):
+            if name not in splits:
+                continue
+            split_slice = splits[name]
+            res_slice = factors[:, split_slice.start_idx:split_slice.end_idx]
+            result = bt.evaluate(
+                res_slice,
+                split_slice.raw_data_cache,
+                split_slice.target_ret,
+                return_details=True,
+            )
+            print_metrics(f"{name.capitalize()} Results", result)
+            if curve_out:
+                suffix = f"_{name}"
+                out_path = Path(curve_out)
+                out_file = out_path.with_name(f"{out_path.stem}{suffix}{out_path.suffix or '.csv'}")
+                save_equity_curve(str(out_file), split_slice.dates, result)
+        return None
+
+    result = bt.evaluate(
+        factors,
         loader.raw_data_cache,
         loader.target_ret,
+        return_details=True,
     )
 
     print("\n" + "=" * 60)
     print("📊 Backtest Results")
     print("=" * 60)
-    print(f"Sortino Score: {score.item():.4f}")
-    print(f"Mean Return: {mean_ret:.4%}")
+    print_metrics("Full Sample", result)
 
-    signal = torch.tanh(factors)
-    position = torch.sign(signal)
-
-    turnover = torch.abs(position - torch.roll(position, 1, dims=1))
-    turnover[:, 0] = 0
-    avg_turnover = turnover.mean().item()
-
-    long_pct = (position > 0).float().mean().item()
-    short_pct = (position < 0).float().mean().item()
-    flat_pct = (position == 0).float().mean().item()
-
-    print("\n📈 Strategy Statistics:")
-    print(f"Avg Turnover: {avg_turnover:.2%}")
-    print(f"Long Positions: {long_pct:.1%}")
-    print(f"Short Positions: {short_pct:.1%}")
-    print(f"Flat Positions: {flat_pct:.1%}")
+    if curve_out:
+        save_equity_curve(curve_out, loader.dates, result)
 
     return {
-        'score': score.item(),
-        'mean_return': mean_ret,
-        'avg_turnover': avg_turnover,
+        'score': result.score.item(),
+        'mean_return': result.mean_return,
+        'avg_turnover': result.metrics["avg_turnover"] if result.metrics else 0.0,
     }
 
 
@@ -1481,6 +2344,9 @@ def main():
     parser.add_argument("--strategy", type=str, default=None, help="Path to strategy JSON file")
     parser.add_argument("--symbols", type=str, default=None, help="Comma-separated list of symbols")
     parser.add_argument("--formula", type=str, default=None, help="Formula as JSON string")
+    parser.add_argument("--split", action="store_true", help="Report train/val/test metrics")
+    parser.add_argument("--walk-forward", action="store_true", help="Run walk-forward validation")
+    parser.add_argument("--curve-out", type=str, default=None, help="Save equity curve CSV")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -1508,7 +2374,13 @@ def main():
         print(f"Testing on symbols: {symbols}")
 
     try:
-        run_backtest(formula, symbols)
+        run_backtest(
+            formula,
+            symbols,
+            split=args.split,
+            walk_forward=args.walk_forward,
+            curve_out=args.curve_out,
+        )
     except Exception as e:
         print(f"\n❌ Backtest failed: {e}")
         import traceback

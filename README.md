@@ -9,6 +9,8 @@ AShareGPT/
     2025/
       000001.SZ.csv
       600519.SH.csv
+    复权因子/
+      000001.SZ.csv
 ```
 Each CSV must contain columns:
 `trade_time, open, high, low, close, vol, amount`
@@ -26,3 +28,5 @@ See `.env.example` for settings (signal minute, exit minute, date filters).
 ## Notes
 - Default backtest window is the **latest 7 trading days** unless you set `CN_MINUTE_END_DATE`.
 - Features are the 5 basic factors: `RET, RET5, VOL_CHG, V_RET, TREND`.
+- Optional adj-factor integration via `CN_USE_ADJ_FACTOR` (default on).
+- Train/Val/Test splits and walk-forward validation are available via env vars.
