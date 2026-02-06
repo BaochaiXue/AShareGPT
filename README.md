@@ -32,6 +32,7 @@ python run_cn_backtest.py --strategy best_cn_strategy.json
 
 ## Environment Variables
 See `.env.example` for settings (signal minute, exit minute, date filters).
+`CN_REWARD_MODE` controls formula ranking in training (`train` or `selection`).
 
 ## Notes
 - Default backtest window is the **latest 120 trading days** unless you set `CN_MINUTE_END_DATE`.

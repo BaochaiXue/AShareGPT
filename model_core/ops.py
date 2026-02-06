@@ -4,10 +4,13 @@ import torch
 
 @torch.jit.script
 def _ts_delay(x: torch.Tensor, d: int) -> torch.Tensor:
-    if d == 0:
+    if d <= 0:
         return x
-    pad = torch.zeros((x.shape[0], d), device=x.device)
-    return torch.cat([pad, x[:, :-d]], dim=1)
+    t = x.shape[1]
+    if d >= t:
+        return torch.zeros_like(x)
+    pad = torch.zeros((x.shape[0], d), device=x.device, dtype=x.dtype)
+    return torch.cat([pad, x[:, : t - d]], dim=1)
 
 @torch.jit.script
 def _ts_delta(x: torch.Tensor, d: int) -> torch.Tensor:
@@ -55,11 +58,17 @@ def _ts_rank(x: torch.Tensor, d: int) -> torch.Tensor:
     less_equal = (windows <= last).to(x.dtype).sum(dim=-1)
     return (less_equal - 1.0) / float(d - 1)
 
+@torch.jit.script
+def _safe_div(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # Keep denominator away from zero while preserving sign.
+    denom = torch.where(y >= 0, y + eps, y - eps)
+    return x / denom
+
 OPS_CONFIG: list[tuple[str, Callable[..., torch.Tensor], int]] = [
     ('ADD', lambda x, y: x + y, 2),
     ('SUB', lambda x, y: x - y, 2),
     ('MUL', lambda x, y: x * y, 2),
-    ('DIV', lambda x, y: x / (y + 1e-6 * torch.sign(y)), 2),
+    ('DIV', _safe_div, 2),
     ('NEG', lambda x: -x, 1),
     ('ABS', torch.abs, 1),
     ('SIGN', torch.sign, 1),

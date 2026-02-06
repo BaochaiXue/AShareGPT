@@ -1,4 +1,3 @@
-
 from typing import Optional, Callable
 import torch
 from .ops import OPS_CONFIG
@@ -54,7 +53,8 @@ class StackVM:
                     arity = self.arity_map[token]
                     
                     # Stack Underflow Check
-                    if len(stack) < arity: return None
+                    if len(stack) < arity:
+                        return None
                     
                     # Pop arguments
                     args = []
@@ -76,11 +76,8 @@ class StackVM:
                     # Unknown Token
                     return None
             
-            # Valid formula must result in exactly one value on the stack
-            if len(stack) == 1:
-                return stack[0]
-            else:
-                return None # Stack not empty (incomplete formula) or empty
+            # Valid formula must result in exactly one value on the stack.
+            return stack[0] if len(stack) == 1 else None
                 
         except Exception:
             return None # Runtime error protection

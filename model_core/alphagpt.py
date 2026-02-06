@@ -47,7 +47,7 @@ class NewtonSchulzLowRankDecay:
     @torch.no_grad()
     def step(self) -> None:
         """Apply Newton-Schulz low-rank decay to target parameters."""
-        for name, W in self.params_to_decay:
+        for _, W in self.params_to_decay:
             orig_dtype = W.dtype
             X = W.float()
             r, c = X.shape
@@ -64,14 +64,14 @@ class NewtonSchulzLowRankDecay:
             
             # Initialize Y for Newton-Schulz iteration
             Y = X
-            I = torch.eye(X.shape[-1], device=X.device, dtype=X.dtype)
+            identity = torch.eye(X.shape[-1], device=X.device, dtype=X.dtype)
             
             # Newton-Schulz iteration: Y_{k+1} = 0.5 * Y_k * (3*I - Y_k^T * Y_k)
             # This converges to an orthogonal matrix sharing the same singular vectors as X.
             # It essentially "whitens" the singular values, pushing them towards 1 or 0.
             for _ in range(self.num_iterations):
                 A = Y.T @ Y
-                Y = 0.5 * Y @ (3.0 * I - A)
+                Y = 0.5 * Y @ (3.0 * identity - A)
             
             if transposed:
                 Y = Y.T
@@ -157,7 +157,7 @@ class MTPHead(nn.Module):
         self.task_heads = nn.ModuleList([
             nn.Linear(d_model, vocab_size) for _ in range(num_tasks)
         ])
-        # Unused parameter? Kept for legacy compatibility.
+        # Learnable global task prior, fused with per-sample router probabilities.
         self.task_weights = nn.Parameter(torch.ones(num_tasks) / num_tasks)
         
         # Router network to decide task importance for each token
@@ -172,7 +172,10 @@ class MTPHead(nn.Module):
         
         # Route to appropriate task heads
         task_logits = self.task_router(x)
-        task_probs = F.softmax(task_logits, dim=-1) # [Batch, NumTasks]
+        router_probs = F.softmax(task_logits, dim=-1)  # [Batch, NumTasks]
+        task_prior = F.softmax(self.task_weights, dim=0)  # [NumTasks]
+        task_probs = router_probs * task_prior.unsqueeze(0)
+        task_probs = task_probs / task_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         
         # Compute all task outputs
         # task_outputs: list of [Batch, VocabSize]
@@ -300,7 +303,7 @@ class AlphaGPT(nn.Module):
             value: Value estimate for RL baseline [Batch, SeqLen, 1]
             task_probs: Weights assigned to each task head [Batch, SeqLen, NumTasks]
         """
-        B, T = idx.size()
+        _, T = idx.size()
         
         x = self.token_emb(idx) + self.pos_emb[:, :T, :]
         

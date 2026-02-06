@@ -46,8 +46,10 @@ class ChinaBacktest:
             and {"high", "low", "open"}.issubset(raw_data.keys())
         ):
             hl_range = (raw_data["high"] - raw_data["low"]).abs() / (raw_data["open"].abs() + 1e-6)
+            # Missing OHLC should not poison pnl with NaN slippage.
+            hl_range = torch.nan_to_num(hl_range, nan=0.0, posinf=0.0, neginf=0.0)
             slip = slip + turnover * self.slippage_impact * hl_range
-        return slip
+        return torch.nan_to_num(slip, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _compute_risk_metrics(
         self,
@@ -161,9 +163,9 @@ class ChinaBacktest:
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
-        valid_prev = torch.roll(valid, 1, dims=1)
-        valid_prev[:, 0] = False
-        turnover = turnover * (valid & valid_prev).float()
+        # Charge turnover only on bars with realized return; this still costs
+        # re-entry after missing-return gaps (valid -> missing -> valid).
+        turnover = turnover * valid_f
 
         slippage = self._compute_slippage(turnover, raw_data)
         safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)

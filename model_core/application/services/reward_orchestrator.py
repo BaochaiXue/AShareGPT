@@ -48,6 +48,24 @@ class FormulaRewardOrchestrator:
         if mode not in {"train", "selection"}:
             raise ValueError(f"Unsupported reward_mode={reward_mode!r}; expected 'train' or 'selection'.")
         self._reward_mode = mode
+        if self._use_wfo:
+            score_split = "train" if self._reward_mode == "train" else "val"
+            has_scoring_window = any(
+                getattr(fold, score_split).end_idx > getattr(fold, score_split).start_idx
+                for fold in self._walk_forward_folds
+            )
+            if not has_scoring_window:
+                raise ValueError(
+                    f"Walk-forward requires non-empty {score_split} windows for reward_mode={self._reward_mode!r}. "
+                    "Adjust CN_WFO_*_DAYS or disable CN_WALK_FORWARD."
+                )
+
+    @staticmethod
+    def _score_to_float(score: object) -> float:
+        """Accept either tensor-like or numeric score values from backtest engines."""
+        if hasattr(score, "item"):
+            return float(score.item())  # type: ignore[call-arg]
+        return float(score)
 
     @torch.no_grad()
     def evaluate_formula(self, formula: list[int], full_feat: torch.Tensor) -> FormulaEvaluation:
@@ -62,33 +80,37 @@ class FormulaRewardOrchestrator:
         return self._evaluate_train_val(res)
 
     def _evaluate_wfo(self, res: torch.Tensor) -> FormulaEvaluation:
-        fold_scores: list[torch.Tensor] = []
+        fold_scores: list[float] = []
         fold_returns: list[float] = []
+        score_split = "train" if self._reward_mode == "train" else "val"
         for fold in self._walk_forward_folds:
-            if fold.val.end_idx <= fold.val.start_idx:
+            split = getattr(fold, score_split)
+            if split.end_idx <= split.start_idx:
                 continue
-            res_val = res[:, fold.val.start_idx : fold.val.end_idx]
-            if res_val.numel() == 0:
+            res_split = res[:, split.start_idx : split.end_idx]
+            if res_split.numel() == 0:
                 continue
             result = self._backtest_engine.evaluate(
-                res_val,
-                fold.val.raw_data_cache,
-                fold.val.target_ret,
+                res_split,
+                split.raw_data_cache,
+                split.target_ret,
             )
-            fold_scores.append(result.score)
+            fold_scores.append(self._score_to_float(result.score))
             fold_returns.append(result.mean_return)
 
         if not fold_scores:
             return FormulaEvaluation(reward=-2.0, selection_score=None, mean_return=0.0)
 
-        reward = float(torch.stack(fold_scores).mean().item())
+        reward = float(sum(fold_scores) / len(fold_scores))
         mean_return = float(sum(fold_returns) / len(fold_returns))
+        train_score = reward if self._reward_mode == "train" else None
+        val_score = reward if self._reward_mode == "selection" else None
         return FormulaEvaluation(
             reward=reward,
             selection_score=reward,
             mean_return=mean_return,
-            train_score=None,
-            val_score=reward,
+            train_score=train_score,
+            val_score=val_score,
         )
 
     def _evaluate_train_val(self, res: torch.Tensor) -> FormulaEvaluation:
@@ -101,7 +123,7 @@ class FormulaRewardOrchestrator:
             self._train_slice.raw_data_cache,
             self._train_slice.target_ret,
         )
-        train_score = float(train_result.score.item())
+        train_score = self._score_to_float(train_result.score)
         selection_score = train_score
         mean_return = float(train_result.mean_return)
         val_score: Optional[float] = None
@@ -114,9 +136,10 @@ class FormulaRewardOrchestrator:
                     self._val_slice.raw_data_cache,
                     self._val_slice.target_ret,
                 )
-                selection_score = float(val_result.score.item())
-                mean_return = float(val_result.mean_return)
-                val_score = selection_score
+                val_score = self._score_to_float(val_result.score)
+                if self._reward_mode == "selection":
+                    selection_score = val_score
+                    mean_return = float(val_result.mean_return)
 
         reward = train_score if self._reward_mode == "train" else selection_score
 

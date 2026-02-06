@@ -99,11 +99,6 @@ class FeatureEngineer:
         """
         device = raw_dict['close'].device
         dtype = raw_dict['close'].dtype
-        
-        # Helper to convert Tensor to DataFrame (for pandas_ta)
-        def to_df(key):
-            t = raw_dict[key].detach().cpu().numpy()
-            return pd.DataFrame(t.T) # [Time, Batch] as columns
 
         # We must process each asset (column) individually or use pandas_ta machinery?
         # AShareGPT handles batch of assets (N Symbols).
@@ -113,9 +108,8 @@ class FeatureEngineer:
         # but mostly they expect single Series.
         # Given "Batch" dimension is usually Symbols (e.g. 50), looping 50 times is fast enough.
         
-        # Convert raw tensors to numpy for pandas processing
-        # Structure: [Batch, Time] -> [Time, Batch] for DataFrame
-        eps = 1e-8
+        # Convert raw tensors to numpy for pandas processing.
+        # Structure: [Batch, Time] -> [Time, Batch] for DataFrame.
         
         opens = raw_dict['open'].detach().cpu().float().numpy().T
         highs = raw_dict['high'].detach().cpu().float().numpy().T

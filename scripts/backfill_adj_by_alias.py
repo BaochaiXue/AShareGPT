@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from model_core.code_alias import load_code_alias_map
+from model_core.code_alias import load_code_alias_map  # noqa: E402
 
 
 ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030")

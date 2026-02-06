@@ -36,7 +36,7 @@ class ModelConfig:
     CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
-    CN_VAL_RATIO = float(os.getenv("CN_VAL_RATIO", "0.15"))
+    CN_VAL_RATIO = float(os.getenv("CN_VAL_RATIO", "0.0"))
     CN_TEST_RATIO = float(os.getenv("CN_TEST_RATIO", "0.15"))
     CN_TRAIN_DAYS = int(os.getenv("CN_TRAIN_DAYS", "0"))
     CN_VAL_DAYS = int(os.getenv("CN_VAL_DAYS", "0"))
@@ -48,7 +48,7 @@ class ModelConfig:
     CN_WFO_STEP_DAYS = int(os.getenv("CN_WFO_STEP_DAYS", "20"))
     CN_FEATURE_NORM = os.getenv("CN_FEATURE_NORM", "train").strip().lower()
     CN_FEATURE_CLIP = float(os.getenv("CN_FEATURE_CLIP", "5.0"))
-    CN_REWARD_MODE = os.getenv("CN_REWARD_MODE", "selection").strip().lower()
+    CN_REWARD_MODE = os.getenv("CN_REWARD_MODE", "train").strip().lower()
     CN_STRICT_FEATURE_INDICATORS = os.getenv("CN_STRICT_FEATURE_INDICATORS", "1") == "1"
     CN_FEATURE_NEAR_ZERO_STD_TOL = float(os.getenv("CN_FEATURE_NEAR_ZERO_STD_TOL", "1e-6"))
     _CN_CODES_RAW = os.getenv("CN_CODES", "")

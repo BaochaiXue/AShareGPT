@@ -61,6 +61,19 @@ class ChinaMinuteDataLoader:
             except ValueError:
                 return None
 
+    def _is_date_only_literal(self, value: str) -> bool:
+        """Return True when value is a date-only literal without clock time."""
+        value = value.strip()
+        if not value:
+            return False
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+            try:
+                datetime.strptime(value, fmt)
+                return True
+            except ValueError:
+                continue
+        return False
+
     def _resolve_years(self, years: Optional[list[int]]) -> list[int]:
         if years:
             return years
@@ -162,16 +175,20 @@ class ChinaMinuteDataLoader:
             test = max(0, ModelConfig.CN_TEST_DAYS)
             if train + val + test == 0:
                 train = total_len
-            if train + val + test < total_len:
-                test += total_len - (train + val + test)
-            if train + val + test > total_len:
-                overflow = train + val + test - total_len
-                test = max(0, test - overflow)
-            if train + val + test > total_len:
-                overflow = train + val + test - total_len
-                val = max(0, val - overflow)
-            if train + val + test > total_len:
-                overflow = train + val + test - total_len
+            allocated = train + val + test
+            if allocated < total_len:
+                test += total_len - allocated
+
+            overflow = train + val + test - total_len
+            if overflow > 0:
+                trim = min(test, overflow)
+                test -= trim
+                overflow -= trim
+            if overflow > 0:
+                trim = min(val, overflow)
+                val -= trim
+                overflow -= trim
+            if overflow > 0:
                 train = max(0, train - overflow)
             return train, val, test
         train = int(total_len * ModelConfig.CN_TRAIN_RATIO)
@@ -336,8 +353,13 @@ class ChinaMinuteDataLoader:
         sig_time = self._parse_time(signal_time or ModelConfig.CN_SIGNAL_TIME) or time(10, 0)
         exit_t = self._parse_time(exit_time or ModelConfig.CN_EXIT_TIME)
 
-        start_dt = pd.to_datetime(start_date or ModelConfig.CN_MINUTE_START_DATE) if (start_date or ModelConfig.CN_MINUTE_START_DATE) else None
-        end_dt = pd.to_datetime(end_date or ModelConfig.CN_MINUTE_END_DATE) if (end_date or ModelConfig.CN_MINUTE_END_DATE) else None
+        start_raw = start_date or ModelConfig.CN_MINUTE_START_DATE
+        end_raw = end_date or ModelConfig.CN_MINUTE_END_DATE
+        start_dt = pd.to_datetime(start_raw) if start_raw else None
+        end_dt = pd.to_datetime(end_raw) if end_raw else None
+        end_dt_exclusive = None
+        if end_dt is not None and self._is_date_only_literal(end_raw):
+            end_dt_exclusive = end_dt.normalize() + pd.Timedelta(days=1)
 
         per_code_frames: dict[str, pd.DataFrame] = {}
 
@@ -358,7 +380,10 @@ class ChinaMinuteDataLoader:
                 df = df.dropna(subset=["trade_time"])
                 if start_dt is not None:
                     df = df[df["trade_time"] >= start_dt]
-                if end_dt is not None:
+                if end_dt_exclusive is not None:
+                    # Date-only end bounds are inclusive of the whole end day.
+                    df = df[df["trade_time"] < end_dt_exclusive]
+                elif end_dt is not None:
                     df = df[df["trade_time"] <= end_dt]
                 if df.empty:
                     continue
@@ -429,21 +454,24 @@ class ChinaMinuteDataLoader:
                 pivot = pivot.fillna(fill_value)
             return pivot
 
-        open_df = build_pivot("open", ffill=True, fill_value=None)
-        high_df = build_pivot("high", ffill=True, fill_value=None)
-        low_df = build_pivot("low", ffill=True, fill_value=None)
-        close_df = build_pivot("close", ffill=True, fill_value=None)
-        volume_df = build_pivot("volume", ffill=False, fill_value=0.0)
-        amount_df = build_pivot("amount", ffill=False, fill_value=0.0)
-        target_df = build_pivot("target_ret", ffill=False, fill_value=None)
-        adj_df = (
-            build_pivot("adj_factor", ffill=True, fill_value=1.0)
-            if ModelConfig.CN_USE_ADJ_FACTOR
-            else None
-        )
+        pivot_specs: dict[str, tuple[bool, Optional[float]]] = {
+            "open": (True, None),
+            "high": (True, None),
+            "low": (True, None),
+            "close": (True, None),
+            "volume": (False, 0.0),
+            "amount": (False, 0.0),
+            "target_ret": (False, None),
+        }
+        pivots: dict[str, pd.DataFrame] = {
+            field: build_pivot(field, ffill=ffill, fill_value=fill_value)
+            for field, (ffill, fill_value) in pivot_specs.items()
+        }
+        if ModelConfig.CN_USE_ADJ_FACTOR:
+            pivots["adj_factor"] = build_pivot("adj_factor", ffill=True, fill_value=1.0)
 
-        index = close_df.index
-        columns = close_df.columns
+        index = pivots["close"].index
+        columns = pivots["close"].columns
         train_len, val_len, test_len = self._resolve_split_sizes(len(index))
         self._validate_split_order(index, train_len, val_len, test_len)
 
@@ -451,21 +479,21 @@ class ChinaMinuteDataLoader:
             pivot = pivot.reindex(index=index, columns=columns)
             return torch.tensor(pivot.values.T, dtype=torch.float32, device=ModelConfig.DEVICE)
 
-        target_tensor = to_tensor(target_df)
-        self._validate_target_ret_mask(target_df, target_tensor)
+        target_tensor = to_tensor(pivots["target_ret"])
+        self._validate_target_ret_mask(pivots["target_ret"], target_tensor)
 
         self.raw_data_cache = {
-            "open": to_tensor(open_df),
-            "high": to_tensor(high_df),
-            "low": to_tensor(low_df),
-            "close": to_tensor(close_df),
-            "volume": to_tensor(volume_df),
-            "amount": to_tensor(amount_df),
-            "liquidity": to_tensor(amount_df),
-            "fdv": to_tensor(amount_df),
+            "open": to_tensor(pivots["open"]),
+            "high": to_tensor(pivots["high"]),
+            "low": to_tensor(pivots["low"]),
+            "close": to_tensor(pivots["close"]),
+            "volume": to_tensor(pivots["volume"]),
+            "amount": to_tensor(pivots["amount"]),
+            "liquidity": to_tensor(pivots["amount"]),
+            "fdv": to_tensor(pivots["amount"]),
         }
-        if adj_df is not None:
-            self.raw_data_cache["adj_factor"] = to_tensor(adj_df)
+        if "adj_factor" in pivots:
+            self.raw_data_cache["adj_factor"] = to_tensor(pivots["adj_factor"])
 
         raw_feat = FeatureEngineer.compute_features(
             self.raw_data_cache,

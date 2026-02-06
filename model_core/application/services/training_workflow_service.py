@@ -219,9 +219,10 @@ class TrainingWorkflowService:
             return_details=True,
         )
         metrics = result.metrics or {}
+        score = float(result.score.item()) if hasattr(result.score, "item") else float(result.score)
         return EvaluationSnapshot(
             label=label,
-            score=float(result.score.item()),
+            score=score,
             mean_return=float(result.mean_return),
             sharpe=float(metrics.get("sharpe", float("nan"))),
             max_drawdown=float(metrics.get("max_drawdown", float("nan"))),
