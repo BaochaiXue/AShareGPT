@@ -73,11 +73,6 @@ class FeatureEngineer:
         return torch.clamp(norm, -clip, clip)
 
     @staticmethod
-    def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
-        """Backward-compatible robust normalization helper."""
-        return FeatureEngineer.apply_robust_norm(t, norm_stats=None, clip=clip)
-
-    @staticmethod
     def compute_features(
         raw_dict: dict[str, torch.Tensor],
         *,

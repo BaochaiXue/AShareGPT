@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Optional
-from warnings import warn
 
 import torch
 
@@ -110,34 +109,5 @@ def create_training_workflow_service(
         use_lord_regularization=use_lord_regularization,
         lord_decay_rate=lord_decay_rate,
         lord_num_iterations=lord_num_iterations,
-        data_kwargs=data_kwargs,
-    )
-
-
-def create_training_engine(
-    *,
-    use_lord_regularization: bool = True,
-    lord_decay_rate: float = 1e-3,
-    lord_num_iterations: int = 5,
-    data_kwargs: Optional[dict[str, Any]] = None,
-):
-    """
-    Backward-compatible engine factory.
-
-    Prefer `create_training_workflow_service` for new wiring.
-    """
-    warn(
-        "create_training_engine() is deprecated; use create_training_workflow_service() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    from model_core.engine import AlphaEngine
-
-    return AlphaEngine(
-        use_lord_regularization=use_lord_regularization,
-        lord_decay_rate=lord_decay_rate,
-        lord_num_iterations=lord_num_iterations,
-        auto_load_data=True,
         data_kwargs=data_kwargs,
     )
