@@ -31,6 +31,19 @@ class TrainingRunState:
     history: dict[str, list[Any]]
 
 
+@dataclass
+class TrainingStepSummary:
+    """One training-step scalar summary for history and progress logging."""
+
+    avg_reward: float
+    policy_loss: float
+    value_loss: float
+    entropy: float
+    avg_train_score: float
+    avg_val_score: float
+    stable_rank: Optional[float]
+
+
 class PpoTrainingService:
     """PPO loop extracted from `AlphaEngine`."""
 
@@ -73,17 +86,7 @@ class PpoTrainingService:
         rank_every: int = 100,
         on_new_best: Optional[Callable[[float, float, list[int]], None]] = None,
     ) -> TrainingRunState:
-        history: dict[str, list[Any]] = {
-            "step": [],
-            "avg_reward": [],
-            "best_score": [],
-            "stable_rank": [],
-            "avg_train_score": [],
-            "avg_val_score": [],
-            "policy_loss": [],
-            "value_loss": [],
-            "entropy": [],
-        }
+        history = self._init_history()
         best_score = -float("inf")
         best_formula: Optional[list[int]] = None
 
@@ -115,43 +118,102 @@ class PpoTrainingService:
                 ppo_max_grad_norm=ppo_max_grad_norm,
             )
 
-            avg_reward = float(rewards.mean().item())
-            postfix = {
-                "AvgRew": f"{avg_reward:.3f}",
-                "BestScore": f"{best_score:.3f}",
-                "PLoss": f"{policy_loss:.3f}",
-                "VLoss": f"{value_loss:.3f}",
-            }
-
-            if rank_monitor and step % rank_every == 0:
-                stable_rank = float(rank_monitor.compute())
-                postfix["Rank"] = f"{stable_rank:.2f}"
-                history["stable_rank"].append(stable_rank)
-
-            if train_scores:
-                avg_train = float(sum(train_scores) / len(train_scores))
-                postfix["Train"] = f"{avg_train:.3f}"
-                history["avg_train_score"].append(avg_train)
-            else:
-                history["avg_train_score"].append(float("nan"))
-
-            if val_scores:
-                avg_val = float(sum(val_scores) / len(val_scores))
-                postfix["Val"] = f"{avg_val:.3f}"
-                history["avg_val_score"].append(avg_val)
-            else:
-                history["avg_val_score"].append(float("nan"))
-
-            history["step"].append(step)
-            history["avg_reward"].append(avg_reward)
-            history["best_score"].append(best_score)
-            history["policy_loss"].append(policy_loss)
-            history["value_loss"].append(value_loss)
-            history["entropy"].append(entropy)
-
-            pbar.set_postfix(postfix)
+            summary = self._build_step_summary(
+                rewards=rewards,
+                train_scores=train_scores,
+                val_scores=val_scores,
+                policy_loss=policy_loss,
+                value_loss=value_loss,
+                entropy=entropy,
+                rank_monitor=rank_monitor,
+                step=step,
+                rank_every=rank_every,
+            )
+            self._append_history(history=history, step=step, best_score=best_score, summary=summary)
+            pbar.set_postfix(self._build_postfix(best_score=best_score, summary=summary))
 
         return TrainingRunState(best_score=best_score, best_formula=best_formula, history=history)
+
+    @staticmethod
+    def _init_history() -> dict[str, list[Any]]:
+        return {
+            "step": [],
+            "avg_reward": [],
+            "best_score": [],
+            "stable_rank": [],
+            "avg_train_score": [],
+            "avg_val_score": [],
+            "policy_loss": [],
+            "value_loss": [],
+            "entropy": [],
+        }
+
+    @staticmethod
+    def _score_average(scores: list[float]) -> float:
+        if not scores:
+            return float("nan")
+        return float(sum(scores) / len(scores))
+
+    def _build_step_summary(
+        self,
+        *,
+        rewards: torch.Tensor,
+        train_scores: list[float],
+        val_scores: list[float],
+        policy_loss: float,
+        value_loss: float,
+        entropy: float,
+        rank_monitor,
+        step: int,
+        rank_every: int,
+    ) -> TrainingStepSummary:
+        stable_rank: Optional[float] = None
+        if rank_monitor and step % rank_every == 0:
+            stable_rank = float(rank_monitor.compute())
+        return TrainingStepSummary(
+            avg_reward=float(rewards.mean().item()),
+            policy_loss=policy_loss,
+            value_loss=value_loss,
+            entropy=entropy,
+            avg_train_score=self._score_average(train_scores),
+            avg_val_score=self._score_average(val_scores),
+            stable_rank=stable_rank,
+        )
+
+    @staticmethod
+    def _append_history(
+        *,
+        history: dict[str, list[Any]],
+        step: int,
+        best_score: float,
+        summary: TrainingStepSummary,
+    ) -> None:
+        history["step"].append(step)
+        history["avg_reward"].append(summary.avg_reward)
+        history["best_score"].append(best_score)
+        history["policy_loss"].append(summary.policy_loss)
+        history["value_loss"].append(summary.value_loss)
+        history["entropy"].append(summary.entropy)
+        history["avg_train_score"].append(summary.avg_train_score)
+        history["avg_val_score"].append(summary.avg_val_score)
+        if summary.stable_rank is not None:
+            history["stable_rank"].append(summary.stable_rank)
+
+    @staticmethod
+    def _build_postfix(*, best_score: float, summary: TrainingStepSummary) -> dict[str, str]:
+        postfix = {
+            "AvgRew": f"{summary.avg_reward:.3f}",
+            "BestScore": f"{best_score:.3f}",
+            "PLoss": f"{summary.policy_loss:.3f}",
+            "VLoss": f"{summary.value_loss:.3f}",
+        }
+        if summary.stable_rank is not None:
+            postfix["Rank"] = f"{summary.stable_rank:.2f}"
+        if summary.avg_train_score == summary.avg_train_score:
+            postfix["Train"] = f"{summary.avg_train_score:.3f}"
+        if summary.avg_val_score == summary.avg_val_score:
+            postfix["Val"] = f"{summary.avg_val_score:.3f}"
+        return postfix
 
     def _sample_rollout(self, *, batch_size: int, max_formula_len: int) -> RolloutBatch:
         inp = torch.full((batch_size, 1), self.bos_id, dtype=torch.long, device=self.device)
@@ -249,49 +311,62 @@ class PpoTrainingService:
         entropy_value = float("nan")
 
         for _ in range(max(1, ppo_epochs)):
-            new_log_probs_steps: list[torch.Tensor] = []
-            values_pred_steps: list[torch.Tensor] = []
-            entropy_steps: list[torch.Tensor] = []
-
-            for t in range(max_formula_len):
-                prefix = rollout.rollout_inputs[:, : t + 1]
-                logits_t, value_t, _ = self.model(prefix)
-                remaining_steps = max_formula_len - t
-                legal_mask_t = self._legal_action_mask(
-                    stack_depth=rollout.stack_depth_steps[t],
-                    remaining_steps=remaining_steps,
-                )
-                masked_logits_t = logits_t.masked_fill(~legal_mask_t, -1e9)
-                dist_t = Categorical(logits=masked_logits_t)
-                actions_t = rollout.seqs[:, t]
-                new_log_probs_steps.append(dist_t.log_prob(actions_t))
-                values_pred_steps.append(value_t.squeeze(-1))
-                entropy_steps.append(dist_t.entropy())
-
-            new_log_probs = torch.stack(new_log_probs_steps, dim=1)
+            new_log_probs, values_pred, entropy_bonus = self._collect_policy_tensors(
+                rollout=rollout,
+                max_formula_len=max_formula_len,
+            )
             ratio = torch.exp(new_log_probs - rollout.old_log_probs)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - ppo_clip_eps, 1.0 + ppo_clip_eps) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
-
-            values_pred = torch.stack(values_pred_steps, dim=1)
             value_loss = F.mse_loss(values_pred, returns_steps)
-            entropy_bonus = torch.stack(entropy_steps, dim=1).mean()
             loss = policy_loss + ppo_value_coef * value_loss - ppo_entropy_coef * entropy_bonus
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            if ppo_max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), ppo_max_grad_norm)
-            self.optimizer.step()
-            if self.use_lord and self.lord_opt:
-                self.lord_opt.step()
+            self._apply_optimizer_step(loss=loss, ppo_max_grad_norm=ppo_max_grad_norm)
 
             policy_loss_value = float(policy_loss.item())
             value_loss_value = float(value_loss.item())
             entropy_value = float(entropy_bonus.item())
 
         return policy_loss_value, value_loss_value, entropy_value
+
+    def _collect_policy_tensors(
+        self,
+        *,
+        rollout: RolloutBatch,
+        max_formula_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        new_log_probs_steps: list[torch.Tensor] = []
+        values_pred_steps: list[torch.Tensor] = []
+        entropy_steps: list[torch.Tensor] = []
+
+        for t in range(max_formula_len):
+            prefix = rollout.rollout_inputs[:, : t + 1]
+            logits_t, value_t, _ = self.model(prefix)
+            remaining_steps = max_formula_len - t
+            legal_mask_t = self._legal_action_mask(
+                stack_depth=rollout.stack_depth_steps[t],
+                remaining_steps=remaining_steps,
+            )
+            masked_logits_t = logits_t.masked_fill(~legal_mask_t, -1e9)
+            dist_t = Categorical(logits=masked_logits_t)
+            actions_t = rollout.seqs[:, t]
+            new_log_probs_steps.append(dist_t.log_prob(actions_t))
+            values_pred_steps.append(value_t.squeeze(-1))
+            entropy_steps.append(dist_t.entropy())
+
+        new_log_probs = torch.stack(new_log_probs_steps, dim=1)
+        values_pred = torch.stack(values_pred_steps, dim=1)
+        entropy_bonus = torch.stack(entropy_steps, dim=1).mean()
+        return new_log_probs, values_pred, entropy_bonus
+
+    def _apply_optimizer_step(self, *, loss: torch.Tensor, ppo_max_grad_norm: float) -> None:
+        self.optimizer.zero_grad()
+        loss.backward()
+        if ppo_max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), ppo_max_grad_norm)
+        self.optimizer.step()
+        if self.use_lord and self.lord_opt:
+            self.lord_opt.step()
 
     def _legal_action_mask(self, *, stack_depth: torch.Tensor, remaining_steps: int) -> torch.Tensor:
         legal = stack_depth.unsqueeze(1) >= self.token_arity.unsqueeze(0)
