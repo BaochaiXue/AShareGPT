@@ -84,6 +84,8 @@ class FeatureEngineer:
         normalize: bool = True,
         norm_stats: Optional[dict[str, torch.Tensor]] = None,
         clip: float = 5.0,
+        strict_indicator_mapping: bool = True,
+        near_zero_std_tol: float = 1e-6,
     ) -> torch.Tensor:
         """
         Compute features using pandas_ta.
@@ -184,6 +186,8 @@ class FeatureEngineer:
             ]
         )
         
+        missing_indicator_patterns: set[str] = set()
+
         # Iterate over each asset
         for i in range(n_assets):
             df = pd.DataFrame({
@@ -218,6 +222,13 @@ class FeatureEngineer:
                     for pat in name_patterns:
                         if col.startswith(pat):
                             return df[col].values
+                pattern_desc = " | ".join(name_patterns)
+                if strict_indicator_mapping:
+                    raise ValueError(
+                        f"Missing indicator mapping [{pattern_desc}] for asset index {i}. "
+                        "Set CN_STRICT_FEATURE_INDICATORS=0 to downgrade to zero-fallback."
+                    )
+                missing_indicator_patterns.add(pattern_desc)
                 return df['close'].values * 0 # Fallback
             
             # 1. Base Prices
@@ -244,7 +255,7 @@ class FeatureEngineer:
             
             # 4. Volatility
             feat_dict['TR'] = get_col(["TR", "TRUERANGE"])
-            feat_dict['ATR14'] = get_col(["ATR_14"])
+            feat_dict['ATR14'] = get_col(["ATR_14", "ATRr_14"])
             feat_dict['NATR14'] = get_col(["NATR_14"])
             
             # 5. Momentum
@@ -301,7 +312,16 @@ class FeatureEngineer:
             feat_dict['AD'] = get_col(["AD"])
             feat_dict['ADOSC'] = get_col(["ADOSC_3_10"])
             feat_dict['CMF'] = get_col(["CMF_20"])
-            feat_dict['MFI14'] = get_col(["MFI_14"])
+            typ_price = (df["high"] + df["low"] + df["close"]) / 3.0
+            raw_money = typ_price * df["volume"]
+            price_delta = typ_price.diff()
+            pos_mf = raw_money.where(price_delta > 0, 0.0)
+            neg_mf = raw_money.where(price_delta < 0, 0.0).abs()
+            pos_sum = pos_mf.rolling(14).sum()
+            neg_sum = neg_mf.rolling(14).sum()
+            money_ratio = pos_sum / (neg_sum + 1e-6)
+            mfi14 = 100.0 - (100.0 / (1.0 + money_ratio))
+            feat_dict['MFI14'] = mfi14.fillna(50.0).values
             
             # custom volume features not in pandas_ta strategy explicitly or need custom calc
             # V_RET
@@ -324,8 +344,31 @@ class FeatureEngineer:
                     val_np = val.copy() if hasattr(val, "copy") else val
                     feat_out[i, f_idx, :] = torch.as_tensor(val_np, dtype=dtype, device=device)
 
-        # Post-process: NaN handling & Normalization
+        # Post-process: NaN handling & lightweight quality checks.
         feat_out = torch.nan_to_num(feat_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if missing_indicator_patterns:
+            samples = sorted(missing_indicator_patterns)[:8]
+            print(
+                f"[feature-check] indicator mapping fallback-to-zero count={len(missing_indicator_patterns)} "
+                f"samples={samples}"
+            )
+
+        if near_zero_std_tol > 0 and feat_out.numel() > 0:
+            # [Asset, Feature, Time] -> [Feature, Asset*Time]
+            per_feature = feat_out.permute(1, 0, 2).reshape(n_features, -1)
+            std = per_feature.std(dim=1, unbiased=False)
+            near_zero_mask = std <= near_zero_std_tol
+            near_zero_count = int(near_zero_mask.sum().item())
+            if near_zero_count > 0:
+                near_zero_names = [
+                    FeatureEngineer.FEATURES[idx]
+                    for idx in torch.nonzero(near_zero_mask, as_tuple=False).flatten().tolist()
+                ]
+                print(
+                    f"[feature-check] near_zero_std={near_zero_count}/{n_features} "
+                    f"tol={near_zero_std_tol:g} samples={near_zero_names[:8]}"
+                )
         
         if not normalize:
             return feat_out

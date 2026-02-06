@@ -429,10 +429,10 @@ class ChinaMinuteDataLoader:
                 pivot = pivot.fillna(fill_value)
             return pivot
 
-        open_df = build_pivot("open", ffill=True, fill_value=0.0)
-        high_df = build_pivot("high", ffill=True, fill_value=0.0)
-        low_df = build_pivot("low", ffill=True, fill_value=0.0)
-        close_df = build_pivot("close", ffill=True, fill_value=0.0)
+        open_df = build_pivot("open", ffill=True, fill_value=None)
+        high_df = build_pivot("high", ffill=True, fill_value=None)
+        low_df = build_pivot("low", ffill=True, fill_value=None)
+        close_df = build_pivot("close", ffill=True, fill_value=None)
         volume_df = build_pivot("volume", ffill=False, fill_value=0.0)
         amount_df = build_pivot("amount", ffill=False, fill_value=0.0)
         target_df = build_pivot("target_ret", ffill=False, fill_value=None)
@@ -467,7 +467,12 @@ class ChinaMinuteDataLoader:
         if adj_df is not None:
             self.raw_data_cache["adj_factor"] = to_tensor(adj_df)
 
-        raw_feat = FeatureEngineer.compute_features(self.raw_data_cache, normalize=False)
+        raw_feat = FeatureEngineer.compute_features(
+            self.raw_data_cache,
+            normalize=False,
+            strict_indicator_mapping=ModelConfig.CN_STRICT_FEATURE_INDICATORS,
+            near_zero_std_tol=ModelConfig.CN_FEATURE_NEAR_ZERO_STD_TOL,
+        )
         self.feat_tensor = self._normalize_features(raw_feat, train_len=train_len)
         self.target_ret = target_tensor
         self.dates = index
