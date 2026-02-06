@@ -42,11 +42,10 @@ class FeatureEngineer:
     @staticmethod
     def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
         """Robust Z-Score Normalization (Cross-Sectional or Time-Series)."""
-        # Here we normalize across time per asset (Time-Series Z-Score) as per original logic,
-        # but robust to outliers using Median and MAD.
-        # t: [Batch, Time]
-        median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-        mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
+        # Normalize along the last axis (time axis).
+        # Works for both [Batch, Time] and [Asset, Feature, Time].
+        median = torch.nanmedian(t, dim=-1, keepdim=True)[0]
+        mad = torch.nanmedian(torch.abs(t - median), dim=-1, keepdim=True)[0] + 1e-6
         norm = (t - median) / mad
         return torch.clamp(norm, -clip, clip)
 

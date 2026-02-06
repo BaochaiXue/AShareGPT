@@ -289,7 +289,8 @@ class AlphaGPT(nn.Module):
         self.ops_list = [cfg[0] for cfg in OPS_CONFIG]
         
         self.vocab = self.features_list + self.ops_list
-        self.vocab_size = len(self.vocab)
+        self.bos_id = len(self.vocab)
+        self.vocab_size = len(self.vocab) + 1
         
         # Embedding
         self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
@@ -333,7 +334,7 @@ class AlphaGPT(nn.Module):
         mask = nn.Transformer.generate_square_subsequent_mask(T).to(idx.device)
         
         # Process through looped transformer
-        x = self.blocks(x, mask=mask, is_causal=True)
+        x = self.blocks(x, mask=mask)
         x = self.ln_f(x)
         
         # Use the representation of the *last* token to predict the next token

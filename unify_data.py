@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 from pathlib import Path
 from typing import Iterable, Optional
@@ -28,11 +29,21 @@ def read_last_line(path: Path) -> str:
             offset = min(size, offset * 2)
 
 
-def get_last_token(path: Path, expect_time: bool) -> Optional[str]:
+def get_last_token(path: Path, expect_time: bool, time_col: str) -> Optional[str]:
+    if not path.exists():
+        return None
     line = read_last_line(path)
     if not line:
         return None
-    token = line.split(",", 1)[0].strip()
+    col_idx = 0
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+        header = next(csv.reader(handle), None)
+        if header and time_col in header:
+            col_idx = header.index(time_col)
+    row = next(csv.reader([line]), [])
+    if col_idx >= len(row):
+        return None
+    token = row[col_idx].strip()
     if expect_time:
         if len(token) >= 10 and token[:4].isdigit():
             return token
@@ -67,7 +78,7 @@ def append_group(
     group = group.dropna(subset=[time_col])
     group = group.drop_duplicates(subset=[time_col], keep="last")
 
-    last_token = get_last_token(output_path, expect_time=expect_time)
+    last_token = get_last_token(output_path, expect_time=expect_time, time_col=time_col)
     if last_token:
         group = group[group[time_col] > last_token]
 
