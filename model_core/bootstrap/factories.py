@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from warnings import warn
 
 import torch
 
-from model_core.alphagpt import AlphaGPT
+from model_core.alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
+from model_core.application.services import TrainingWorkflowService, build_token_tables
 from model_core.backtest import ChinaBacktest
 from model_core.config import ModelConfig
 from model_core.data_loader import ChinaMinuteDataLoader
-from model_core.engine import AlphaEngine
 from model_core.vm import StackVM
 
 
@@ -24,36 +25,119 @@ def _default_data_kwargs() -> dict[str, Any]:
     }
 
 
+def create_training_workflow_service_from_components(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+    loader: Optional[ChinaMinuteDataLoader] = None,
+    model: Optional[AlphaGPT] = None,
+    optimizer=None,
+    vm: Optional[StackVM] = None,
+    backtest: Optional[ChinaBacktest] = None,
+    auto_load_data: bool = True,
+    data_kwargs: Optional[dict[str, Any]] = None,
+) -> TrainingWorkflowService:
+    """Build training workflow from optional runtime components."""
+
+    loader = loader or ChinaMinuteDataLoader()
+    if auto_load_data and loader.feat_tensor is None:
+        loader.load_data(**(data_kwargs or _default_data_kwargs()))
+    if loader.dates is None:
+        raise ValueError("Data not loaded. Provide a loaded loader or enable auto_load_data.")
+
+    model = model or AlphaGPT().to(ModelConfig.DEVICE)
+    optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=1e-3)
+    vm = vm or StackVM()
+    backtest = backtest or ChinaBacktest()
+    token_arity, token_delta = build_token_tables(
+        vocab_size=model.vocab_size,
+        feat_offset=vm.feat_offset,
+        arity_map=vm.arity_map,
+    )
+
+    use_lord = bool(use_lord_regularization)
+    if use_lord:
+        lord_opt = NewtonSchulzLowRankDecay(
+            model.named_parameters(),
+            decay_rate=lord_decay_rate,
+            num_iterations=lord_num_iterations,
+            target_keywords=["q_proj", "k_proj", "attention", "qk_norm"],
+        )
+        rank_monitor = StableRankMonitor(
+            model,
+            target_keywords=["attention", "in_proj", "out_proj"],
+        )
+    else:
+        lord_opt = None
+        rank_monitor = None
+
+    return TrainingWorkflowService(
+        loader=loader,
+        model=model,
+        optimizer=optimizer,
+        vm=vm,
+        backtest_engine=backtest,
+        bos_id=model.bos_id,
+        token_arity=token_arity.to(ModelConfig.DEVICE),
+        token_delta=token_delta.to(ModelConfig.DEVICE),
+        device=ModelConfig.DEVICE,
+        use_lord=use_lord,
+        lord_opt=lord_opt,
+        rank_monitor=rank_monitor,
+        train_steps=ModelConfig.TRAIN_STEPS,
+        batch_size=ModelConfig.BATCH_SIZE,
+        max_formula_len=ModelConfig.MAX_FORMULA_LEN,
+        ppo_epochs=ModelConfig.PPO_EPOCHS,
+        ppo_clip_eps=ModelConfig.PPO_CLIP_EPS,
+        ppo_value_coef=ModelConfig.PPO_VALUE_COEF,
+        ppo_entropy_coef=ModelConfig.PPO_ENTROPY_COEF,
+        ppo_max_grad_norm=ModelConfig.PPO_MAX_GRAD_NORM,
+        rank_every=100,
+    )
+
+
+def create_training_workflow_service(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+    data_kwargs: Optional[dict[str, Any]] = None,
+) -> TrainingWorkflowService:
+    """Build the application-level training workflow from the composition root."""
+
+    return create_training_workflow_service_from_components(
+        use_lord_regularization=use_lord_regularization,
+        lord_decay_rate=lord_decay_rate,
+        lord_num_iterations=lord_num_iterations,
+        data_kwargs=data_kwargs,
+    )
+
+
 def create_training_engine(
     *,
     use_lord_regularization: bool = True,
     lord_decay_rate: float = 1e-3,
     lord_num_iterations: int = 5,
     data_kwargs: Optional[dict[str, Any]] = None,
-) -> AlphaEngine:
+):
     """
-    Build the training runtime from the composition root.
+    Backward-compatible engine factory.
 
-    This keeps dependency assembly out of `AlphaEngine`.
+    Prefer `create_training_workflow_service` for new wiring.
     """
+    warn(
+        "create_training_engine() is deprecated; use create_training_workflow_service() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
-    loader = ChinaMinuteDataLoader()
-    loader.load_data(**(data_kwargs or _default_data_kwargs()))
-
-    model = AlphaGPT().to(ModelConfig.DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    vm = StackVM()
-    backtest = ChinaBacktest()
+    from model_core.engine import AlphaEngine
 
     return AlphaEngine(
         use_lord_regularization=use_lord_regularization,
         lord_decay_rate=lord_decay_rate,
         lord_num_iterations=lord_num_iterations,
-        loader=loader,
-        model=model,
-        optimizer=optimizer,
-        vm=vm,
-        backtest=backtest,
-        auto_load_data=False,
+        auto_load_data=True,
+        data_kwargs=data_kwargs,
     )
-

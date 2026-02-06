@@ -9,7 +9,7 @@ from model_core.infrastructure.legacy import (
     LegacyChinaDataGateway,
     LegacyStackVmExecutor,
 )
-from .factories import create_training_engine
+from .factories import create_training_workflow_service
 
 
 @dataclass
@@ -50,6 +50,6 @@ def create_legacy_container(
             use_lord_regularization=use_lord_regularization,
             lord_decay_rate=lord_decay_rate,
             lord_num_iterations=lord_num_iterations,
-            engine_factory=create_training_engine,
+            workflow_factory=create_training_workflow_service,
         ),
     )
