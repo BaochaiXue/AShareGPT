@@ -255,6 +255,7 @@ dependencies:
   - pandas-ta
   - pip
   - pip:
+      - pandas-ta-classic
       - -r requirements.txt
 ```
 
@@ -725,6 +726,906 @@ class AlphaGPT(nn.Module):
         return logits, value, task_probs
 ```
 
+model_core/application/__init__.py
+```python
+"""Application-layer orchestration for AShareGPT."""
+
+```
+
+model_core/application/services/__init__.py
+```python
+"""Training and evaluation services."""
+
+from .ppo_training_service import PpoTrainingService, TrainingRunState
+from .reward_orchestrator import FormulaEvaluation, FormulaRewardOrchestrator
+from .training_workflow_service import (
+    EvaluationSnapshot,
+    TrainingWorkflowResult,
+    TrainingWorkflowService,
+    build_token_tables,
+)
+
+__all__ = [
+    "build_token_tables",
+    "EvaluationSnapshot",
+    "FormulaEvaluation",
+    "FormulaRewardOrchestrator",
+    "PpoTrainingService",
+    "TrainingWorkflowResult",
+    "TrainingWorkflowService",
+    "TrainingRunState",
+]
+```
+
+model_core/application/services/ppo_training_service.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+import torch
+import torch.nn.functional as F
+from torch.distributions import Categorical
+from tqdm import tqdm
+
+from .reward_orchestrator import FormulaRewardOrchestrator
+
+
+@dataclass
+class RolloutBatch:
+    """Collected rollout tensors for one PPO step."""
+
+    seqs: torch.Tensor
+    rollout_inputs: torch.Tensor
+    old_log_probs: torch.Tensor
+    old_values: torch.Tensor
+    stack_depth_steps: list[torch.Tensor]
+
+
+@dataclass
+class TrainingRunState:
+    """Training outputs consumed by the compatibility engine."""
+
+    best_score: float
+    best_formula: Optional[list[int]]
+    history: dict[str, list[Any]]
+
+
+class PpoTrainingService:
+    """PPO loop extracted from `AlphaEngine`."""
+
+    def __init__(
+        self,
+        *,
+        model,
+        optimizer,
+        bos_id: int,
+        token_arity: torch.Tensor,
+        token_delta: torch.Tensor,
+        device: torch.device,
+        reward_orchestrator: FormulaRewardOrchestrator,
+        use_lord: bool = False,
+        lord_opt=None,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.bos_id = int(bos_id)
+        self.token_arity = token_arity
+        self.token_delta = token_delta
+        self.device = device
+        self.reward_orchestrator = reward_orchestrator
+        self.use_lord = use_lord
+        self.lord_opt = lord_opt
+
+    def train(
+        self,
+        *,
+        full_feat: torch.Tensor,
+        train_steps: int,
+        batch_size: int,
+        max_formula_len: int,
+        ppo_epochs: int,
+        ppo_clip_eps: float,
+        ppo_value_coef: float,
+        ppo_entropy_coef: float,
+        ppo_max_grad_norm: float,
+        rank_monitor=None,
+        rank_every: int = 100,
+        on_new_best: Optional[Callable[[float, float, list[int]], None]] = None,
+    ) -> TrainingRunState:
+        history: dict[str, list[Any]] = {
+            "step": [],
+            "avg_reward": [],
+            "best_score": [],
+            "stable_rank": [],
+            "avg_val_score": [],
+            "policy_loss": [],
+            "value_loss": [],
+            "entropy": [],
+        }
+        best_score = -float("inf")
+        best_formula: Optional[list[int]] = None
+
+        pbar = tqdm(range(train_steps))
+        for step in pbar:
+            rollout = self._sample_rollout(batch_size=batch_size, max_formula_len=max_formula_len)
+            rewards, val_scores, best_score, best_formula = self._evaluate_batch(
+                seqs=rollout.seqs,
+                full_feat=full_feat,
+                best_score=best_score,
+                best_formula=best_formula,
+                on_new_best=on_new_best,
+            )
+
+            returns_steps, advantages = self._compute_advantages(
+                rewards=rewards,
+                old_values=rollout.old_values,
+                max_formula_len=max_formula_len,
+            )
+            policy_loss, value_loss, entropy = self._run_ppo_updates(
+                rollout=rollout,
+                returns_steps=returns_steps,
+                advantages=advantages,
+                max_formula_len=max_formula_len,
+                ppo_epochs=ppo_epochs,
+                ppo_clip_eps=ppo_clip_eps,
+                ppo_value_coef=ppo_value_coef,
+                ppo_entropy_coef=ppo_entropy_coef,
+                ppo_max_grad_norm=ppo_max_grad_norm,
+            )
+
+            avg_reward = float(rewards.mean().item())
+            postfix = {
+                "AvgRew": f"{avg_reward:.3f}",
+                "BestScore": f"{best_score:.3f}",
+                "PLoss": f"{policy_loss:.3f}",
+                "VLoss": f"{value_loss:.3f}",
+            }
+
+            if rank_monitor and step % rank_every == 0:
+                stable_rank = float(rank_monitor.compute())
+                postfix["Rank"] = f"{stable_rank:.2f}"
+                history["stable_rank"].append(stable_rank)
+
+            if val_scores:
+                avg_val = float(sum(val_scores) / len(val_scores))
+                postfix["Val"] = f"{avg_val:.3f}"
+                history["avg_val_score"].append(avg_val)
+            else:
+                history["avg_val_score"].append(float("nan"))
+
+            history["step"].append(step)
+            history["avg_reward"].append(avg_reward)
+            history["best_score"].append(best_score)
+            history["policy_loss"].append(policy_loss)
+            history["value_loss"].append(value_loss)
+            history["entropy"].append(entropy)
+
+            pbar.set_postfix(postfix)
+
+        return TrainingRunState(best_score=best_score, best_formula=best_formula, history=history)
+
+    def _sample_rollout(self, *, batch_size: int, max_formula_len: int) -> RolloutBatch:
+        inp = torch.full((batch_size, 1), self.bos_id, dtype=torch.long, device=self.device)
+        stack_depth = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+        old_log_probs: list[torch.Tensor] = []
+        old_values_steps: list[torch.Tensor] = []
+        tokens_list: list[torch.Tensor] = []
+        stack_depth_steps: list[torch.Tensor] = []
+
+        for t in range(max_formula_len):
+            logits, value_t, _ = self.model(inp)
+            stack_depth_steps.append(stack_depth.clone())
+            old_values_steps.append(value_t.squeeze(-1).detach())
+
+            remaining_steps = max_formula_len - t
+            legal_mask = self._legal_action_mask(stack_depth=stack_depth, remaining_steps=remaining_steps)
+            masked_logits = logits.masked_fill(~legal_mask, -1e9)
+            dist = Categorical(logits=masked_logits)
+            action = dist.sample()
+
+            old_log_probs.append(dist.log_prob(action).detach())
+            tokens_list.append(action)
+            stack_depth = stack_depth + self.token_delta[action]
+            inp = torch.cat([inp, action.unsqueeze(1)], dim=1)
+
+        return RolloutBatch(
+            seqs=torch.stack(tokens_list, dim=1),
+            rollout_inputs=inp.detach(),
+            old_log_probs=torch.stack(old_log_probs, dim=1).detach(),
+            old_values=torch.stack(old_values_steps, dim=1),
+            stack_depth_steps=stack_depth_steps,
+        )
+
+    def _evaluate_batch(
+        self,
+        *,
+        seqs: torch.Tensor,
+        full_feat: torch.Tensor,
+        best_score: float,
+        best_formula: Optional[list[int]],
+        on_new_best: Optional[Callable[[float, float, list[int]], None]],
+    ) -> tuple[torch.Tensor, list[float], float, Optional[list[int]]]:
+        batch_size = seqs.shape[0]
+        rewards = torch.zeros(batch_size, device=self.device)
+        val_scores: list[float] = []
+
+        for i in range(batch_size):
+            formula = seqs[i].tolist()
+            eval_out = self.reward_orchestrator.evaluate_formula(formula, full_feat)
+            rewards[i] = eval_out.reward
+            if eval_out.val_score is not None:
+                val_scores.append(eval_out.val_score)
+            if eval_out.selection_score is None:
+                continue
+            if eval_out.selection_score > best_score:
+                best_score = eval_out.selection_score
+                best_formula = formula
+                if on_new_best:
+                    on_new_best(best_score, eval_out.mean_return, formula)
+
+        return rewards, val_scores, best_score, best_formula
+
+    def _compute_advantages(
+        self,
+        *,
+        rewards: torch.Tensor,
+        old_values: torch.Tensor,
+        max_formula_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        returns = torch.nan_to_num(rewards.detach(), nan=-2.0, posinf=5.0, neginf=-5.0)
+        returns_steps = returns.unsqueeze(1).expand(-1, max_formula_len)
+        advantages = returns_steps - old_values
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-5)
+        return returns_steps, advantages.detach()
+
+    def _run_ppo_updates(
+        self,
+        *,
+        rollout: RolloutBatch,
+        returns_steps: torch.Tensor,
+        advantages: torch.Tensor,
+        max_formula_len: int,
+        ppo_epochs: int,
+        ppo_clip_eps: float,
+        ppo_value_coef: float,
+        ppo_entropy_coef: float,
+        ppo_max_grad_norm: float,
+    ) -> tuple[float, float, float]:
+        policy_loss_value = float("nan")
+        value_loss_value = float("nan")
+        entropy_value = float("nan")
+
+        for _ in range(max(1, ppo_epochs)):
+            new_log_probs_steps: list[torch.Tensor] = []
+            values_pred_steps: list[torch.Tensor] = []
+            entropy_steps: list[torch.Tensor] = []
+
+            for t in range(max_formula_len):
+                prefix = rollout.rollout_inputs[:, : t + 1]
+                logits_t, value_t, _ = self.model(prefix)
+                remaining_steps = max_formula_len - t
+                legal_mask_t = self._legal_action_mask(
+                    stack_depth=rollout.stack_depth_steps[t],
+                    remaining_steps=remaining_steps,
+                )
+                masked_logits_t = logits_t.masked_fill(~legal_mask_t, -1e9)
+                dist_t = Categorical(logits=masked_logits_t)
+                actions_t = rollout.seqs[:, t]
+                new_log_probs_steps.append(dist_t.log_prob(actions_t))
+                values_pred_steps.append(value_t.squeeze(-1))
+                entropy_steps.append(dist_t.entropy())
+
+            new_log_probs = torch.stack(new_log_probs_steps, dim=1)
+            ratio = torch.exp(new_log_probs - rollout.old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1.0 - ppo_clip_eps, 1.0 + ppo_clip_eps) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            values_pred = torch.stack(values_pred_steps, dim=1)
+            value_loss = F.mse_loss(values_pred, returns_steps)
+            entropy_bonus = torch.stack(entropy_steps, dim=1).mean()
+            loss = policy_loss + ppo_value_coef * value_loss - ppo_entropy_coef * entropy_bonus
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            if ppo_max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), ppo_max_grad_norm)
+            self.optimizer.step()
+            if self.use_lord and self.lord_opt:
+                self.lord_opt.step()
+
+            policy_loss_value = float(policy_loss.item())
+            value_loss_value = float(value_loss.item())
+            entropy_value = float(entropy_bonus.item())
+
+        return policy_loss_value, value_loss_value, entropy_value
+
+    def _legal_action_mask(self, *, stack_depth: torch.Tensor, remaining_steps: int) -> torch.Tensor:
+        legal = stack_depth.unsqueeze(1) >= self.token_arity.unsqueeze(0)
+        next_depth = stack_depth.unsqueeze(1) + self.token_delta.unsqueeze(0)
+        if remaining_steps > 1:
+            legal = legal & (next_depth <= remaining_steps)
+        else:
+            legal = legal & (next_depth == 1)
+        legal[:, self.bos_id] = False
+        return legal
+
+```
+
+model_core/application/services/reward_orchestrator.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+from model_core.data_loader import DataSlice, WalkForwardFold
+
+
+@dataclass
+class FormulaEvaluation:
+    """Reward and selection metrics for one candidate formula."""
+
+    reward: float
+    selection_score: Optional[float]
+    mean_return: float
+    val_score: Optional[float] = None
+
+
+class FormulaRewardOrchestrator:
+    """
+    Pure orchestration for formula scoring.
+
+    This service extracts reward logic from the training loop so it can be tested
+    without running PPO end-to-end.
+    """
+
+    def __init__(
+        self,
+        *,
+        vm,
+        backtest_engine,
+        train_slice: DataSlice,
+        val_slice: Optional[DataSlice],
+        walk_forward_folds: list[WalkForwardFold],
+        use_wfo: bool,
+    ):
+        self._vm = vm
+        self._backtest_engine = backtest_engine
+        self._train_slice = train_slice
+        self._val_slice = val_slice
+        self._walk_forward_folds = walk_forward_folds
+        self._use_wfo = use_wfo
+
+    @torch.no_grad()
+    def evaluate_formula(self, formula: list[int], full_feat: torch.Tensor) -> FormulaEvaluation:
+        res = self._vm.execute(formula, full_feat)
+        if res is None:
+            return FormulaEvaluation(reward=-5.0, selection_score=None, mean_return=0.0)
+        if res.std() < 1e-4:
+            return FormulaEvaluation(reward=-2.0, selection_score=None, mean_return=0.0)
+
+        if self._use_wfo:
+            return self._evaluate_wfo(res)
+        return self._evaluate_train_val(res)
+
+    def _evaluate_wfo(self, res: torch.Tensor) -> FormulaEvaluation:
+        fold_scores: list[torch.Tensor] = []
+        fold_returns: list[float] = []
+        for fold in self._walk_forward_folds:
+            if fold.val.end_idx <= fold.val.start_idx:
+                continue
+            res_val = res[:, fold.val.start_idx : fold.val.end_idx]
+            if res_val.numel() == 0:
+                continue
+            result = self._backtest_engine.evaluate(
+                res_val,
+                fold.val.raw_data_cache,
+                fold.val.target_ret,
+            )
+            fold_scores.append(result.score)
+            fold_returns.append(result.mean_return)
+
+        if not fold_scores:
+            return FormulaEvaluation(reward=-2.0, selection_score=None, mean_return=0.0)
+
+        reward = float(torch.stack(fold_scores).mean().item())
+        mean_return = float(sum(fold_returns) / len(fold_returns))
+        return FormulaEvaluation(
+            reward=reward,
+            selection_score=reward,
+            mean_return=mean_return,
+        )
+
+    def _evaluate_train_val(self, res: torch.Tensor) -> FormulaEvaluation:
+        res_train = res[:, self._train_slice.start_idx : self._train_slice.end_idx]
+        if res_train.numel() == 0 or res_train.std() < 1e-4:
+            return FormulaEvaluation(reward=-2.0, selection_score=None, mean_return=0.0)
+
+        train_result = self._backtest_engine.evaluate(
+            res_train,
+            self._train_slice.raw_data_cache,
+            self._train_slice.target_ret,
+        )
+        reward = float(train_result.score.item())
+        selection_score = reward
+        mean_return = float(train_result.mean_return)
+        val_score: Optional[float] = None
+
+        if self._val_slice and self._val_slice.end_idx > self._val_slice.start_idx:
+            res_val = res[:, self._val_slice.start_idx : self._val_slice.end_idx]
+            if res_val.numel() > 0:
+                val_result = self._backtest_engine.evaluate(
+                    res_val,
+                    self._val_slice.raw_data_cache,
+                    self._val_slice.target_ret,
+                )
+                selection_score = float(val_result.score.item())
+                mean_return = float(val_result.mean_return)
+                val_score = selection_score
+
+        return FormulaEvaluation(
+            reward=reward,
+            selection_score=selection_score,
+            mean_return=mean_return,
+            val_score=val_score,
+        )
+
+```
+
+model_core/application/services/training_workflow_service.py
+```python
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+import torch
+
+from model_core.config import ModelConfig
+from model_core.data_loader import ChinaMinuteDataLoader, DataSlice
+from .ppo_training_service import PpoTrainingService
+from .reward_orchestrator import FormulaRewardOrchestrator
+
+
+def build_token_tables(
+    *,
+    vocab_size: int,
+    feat_offset: int,
+    arity_map: dict[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build token arity/delta tables consumed by PPO sampling."""
+
+    token_arity = torch.zeros(vocab_size, dtype=torch.long)
+    token_arity[:feat_offset] = 0
+
+    token_delta = torch.ones(vocab_size, dtype=torch.long)
+    for token, arity in arity_map.items():
+        if 0 <= token < vocab_size:
+            arity_int = int(arity)
+            token_arity[token] = arity_int
+            token_delta[token] = 1 - arity_int
+    return token_arity, token_delta
+
+
+@dataclass
+class EvaluationSnapshot:
+    """Post-training evaluation line for one dataset window."""
+
+    label: str
+    score: float
+    mean_return: float
+    sharpe: float
+    max_drawdown: float
+
+
+@dataclass
+class TrainingWorkflowResult:
+    """Structured output of a training run."""
+
+    best_score: float
+    best_formula: Optional[list[int]]
+    history: dict[str, list[Any]]
+    evaluations: list[EvaluationSnapshot]
+
+
+class TrainingWorkflowService:
+    """High-level training workflow extracted from the compatibility engine."""
+
+    def __init__(
+        self,
+        *,
+        loader: ChinaMinuteDataLoader,
+        model,
+        optimizer,
+        vm,
+        backtest_engine,
+        bos_id: int,
+        token_arity: torch.Tensor,
+        token_delta: torch.Tensor,
+        device: torch.device,
+        use_lord: bool,
+        lord_opt=None,
+        rank_monitor=None,
+        train_steps: int,
+        batch_size: int,
+        max_formula_len: int,
+        ppo_epochs: int,
+        ppo_clip_eps: float,
+        ppo_value_coef: float,
+        ppo_entropy_coef: float,
+        ppo_max_grad_norm: float,
+        rank_every: int = 100,
+    ):
+        self.loader = loader
+        self.model = model
+        self.optimizer = optimizer
+        self.vm = vm
+        self.backtest_engine = backtest_engine
+        self.bos_id = int(bos_id)
+        self.token_arity = token_arity
+        self.token_delta = token_delta
+        self.device = device
+
+        self.use_lord = bool(use_lord)
+        self.lord_opt = lord_opt
+        self.rank_monitor = rank_monitor
+
+        self.train_steps = int(train_steps)
+        self.batch_size = int(batch_size)
+        self.max_formula_len = int(max_formula_len)
+        self.ppo_epochs = int(ppo_epochs)
+        self.ppo_clip_eps = float(ppo_clip_eps)
+        self.ppo_value_coef = float(ppo_value_coef)
+        self.ppo_entropy_coef = float(ppo_entropy_coef)
+        self.ppo_max_grad_norm = float(ppo_max_grad_norm)
+        self.rank_every = int(rank_every)
+
+        self.splits = self.loader.train_val_test_split()
+        self.train_slice = self.splits.get("train")
+        self.val_slice = self.splits.get("val")
+        self.test_slice = self.splits.get("test")
+        self.walk_forward_folds = self.loader.walk_forward_splits() if ModelConfig.CN_WALK_FORWARD else []
+        self.use_wfo = ModelConfig.CN_WALK_FORWARD and len(self.walk_forward_folds) > 0
+
+    def run(
+        self,
+        *,
+        strategy_path: str,
+        history_path: str = "training_history.json",
+        on_new_best: Optional[Callable[[float, float, list[int]], None]] = None,
+    ) -> TrainingWorkflowResult:
+        full_feat = self.loader.feat_tensor
+        if full_feat is None or self.loader.raw_data_cache is None or self.loader.target_ret is None:
+            raise ValueError("Data not loaded. Check data loader.")
+
+        train_slice = self.train_slice
+        if train_slice is None:
+            train_slice = self.loader.get_slice(0, full_feat.shape[-1])
+
+        reward_orchestrator = FormulaRewardOrchestrator(
+            vm=self.vm,
+            backtest_engine=self.backtest_engine,
+            train_slice=train_slice,
+            val_slice=self.val_slice,
+            walk_forward_folds=self.walk_forward_folds,
+            use_wfo=self.use_wfo,
+        )
+        ppo_service = PpoTrainingService(
+            model=self.model,
+            optimizer=self.optimizer,
+            bos_id=self.bos_id,
+            token_arity=self.token_arity,
+            token_delta=self.token_delta,
+            device=self.device,
+            reward_orchestrator=reward_orchestrator,
+            use_lord=self.use_lord,
+            lord_opt=self.lord_opt,
+        )
+
+        run_state = ppo_service.train(
+            full_feat=full_feat,
+            train_steps=self.train_steps,
+            batch_size=self.batch_size,
+            max_formula_len=self.max_formula_len,
+            ppo_epochs=self.ppo_epochs,
+            ppo_clip_eps=self.ppo_clip_eps,
+            ppo_value_coef=self.ppo_value_coef,
+            ppo_entropy_coef=self.ppo_entropy_coef,
+            ppo_max_grad_norm=self.ppo_max_grad_norm,
+            rank_monitor=self.rank_monitor if self.use_lord else None,
+            rank_every=self.rank_every,
+            on_new_best=on_new_best,
+        )
+
+        with open(strategy_path, "w", encoding="utf-8") as handle:
+            json.dump(run_state.best_formula, handle)
+        with open(history_path, "w", encoding="utf-8") as handle:
+            json.dump(run_state.history, handle)
+
+        evaluations = self._evaluate_best_formula(run_state.best_formula, full_feat)
+        return TrainingWorkflowResult(
+            best_score=run_state.best_score,
+            best_formula=run_state.best_formula,
+            history=run_state.history,
+            evaluations=evaluations,
+        )
+
+    def _evaluate_best_formula(
+        self,
+        best_formula: Optional[list[int]],
+        full_feat: torch.Tensor,
+    ) -> list[EvaluationSnapshot]:
+        if not best_formula or self.use_wfo:
+            return []
+
+        res = self.vm.execute(best_formula, full_feat)
+        if res is None:
+            return []
+
+        snapshots: list[EvaluationSnapshot] = []
+        for label, data_slice in (
+            ("Train", self.train_slice),
+            ("Val", self.val_slice),
+            ("Test", self.test_slice),
+        ):
+            if data_slice is None:
+                continue
+            snapshots.append(self._evaluate_slice(label=label, signal=res, data_slice=data_slice))
+        return snapshots
+
+    def _evaluate_slice(
+        self,
+        *,
+        label: str,
+        signal: torch.Tensor,
+        data_slice: DataSlice,
+    ) -> EvaluationSnapshot:
+        sig_slice = signal[:, data_slice.start_idx : data_slice.end_idx]
+        result = self.backtest_engine.evaluate(
+            sig_slice,
+            data_slice.raw_data_cache,
+            data_slice.target_ret,
+            return_details=True,
+        )
+        metrics = result.metrics or {}
+        return EvaluationSnapshot(
+            label=label,
+            score=float(result.score.item()),
+            mean_return=float(result.mean_return),
+            sharpe=float(metrics.get("sharpe", float("nan"))),
+            max_drawdown=float(metrics.get("max_drawdown", float("nan"))),
+        )
+
+    def train_window_descriptions(self) -> list[str]:
+        """Return printable window descriptions for CLI compatibility logs."""
+
+        if self.use_wfo:
+            return [f"   Walk-forward validation: {len(self.walk_forward_folds)} folds"]
+
+        lines: list[str] = []
+        if self.train_slice is not None:
+            lines.append(
+                f"   Train window: {self.train_slice.dates.min()} -> {self.train_slice.dates.max()}"
+            )
+        if self.val_slice is not None:
+            lines.append(f"   Val window:   {self.val_slice.dates.min()} -> {self.val_slice.dates.max()}")
+        if self.test_slice is not None:
+            lines.append(
+                f"   Test window:  {self.test_slice.dates.min()} -> {self.test_slice.dates.max()}"
+            )
+        return lines
+```
+
+model_core/application/use_cases/__init__.py
+```python
+"""Use-case implementations."""
+
+from .backtest_formula import BacktestFormulaUseCase
+from .train_alpha import TrainAlphaUseCase
+
+__all__ = ["BacktestFormulaUseCase", "TrainAlphaUseCase"]
+
+```
+
+model_core/application/use_cases/backtest_formula.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import torch
+
+from model_core.domain.models import Formula
+from model_core.ports.interfaces import (
+    BacktestEnginePort,
+    DataGatewayPort,
+    FormulaExecutorPort,
+)
+
+
+@dataclass
+class BacktestUseCaseResult:
+    """Result envelope for orchestrated backtest calls."""
+
+    ok: bool
+    message: str
+    payload: Optional[dict] = None
+
+
+class BacktestFormulaUseCase:
+    """Application service that orchestrates load -> execute -> evaluate."""
+
+    def __init__(
+        self,
+        data_gateway: DataGatewayPort,
+        executor: FormulaExecutorPort,
+        backtest_engine: BacktestEnginePort,
+    ):
+        self._data_gateway = data_gateway
+        self._executor = executor
+        self._backtest_engine = backtest_engine
+
+    def run(
+        self,
+        *,
+        formula: Formula,
+        mode: str = "full",
+        symbols: Optional[list[str]] = None,
+        years: Optional[list[int]] = None,
+        start_date: str = "",
+        end_date: str = "",
+        signal_time: str = "",
+        exit_time: str = "",
+        limit_codes: int = 50,
+        return_details: bool = True,
+    ) -> BacktestUseCaseResult:
+        if mode not in {"full", "split", "walk_forward"}:
+            return BacktestUseCaseResult(ok=False, message=f"Unsupported mode: {mode}")
+
+        self._data_gateway.load(
+            codes=symbols,
+            years=years,
+            start_date=start_date,
+            end_date=end_date,
+            signal_time=signal_time,
+            exit_time=exit_time,
+            limit_codes=limit_codes,
+        )
+        bundle = self._data_gateway.bundle()
+        factors = self._executor.execute(formula, bundle.feat_tensor)
+        if factors is None:
+            return BacktestUseCaseResult(
+                ok=False,
+                message="Invalid formula - execution failed.",
+            )
+
+        warnings: list[str] = []
+        if torch.std(factors) < 1e-4:
+            warnings.append("Factor has near-zero variance (trivial formula).")
+
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "symbols": bundle.symbols,
+            "dates": bundle.dates,
+            "feat_shape": tuple(bundle.feat_tensor.shape),
+            "warnings": warnings,
+        }
+
+        if mode == "full":
+            result = self._backtest_engine.evaluate(
+                factors,
+                bundle.raw_data_cache,
+                bundle.target_ret,
+                return_details=return_details,
+            )
+            payload["result"] = result
+            return BacktestUseCaseResult(
+                ok=True,
+                message="Backtest completed.",
+                payload=payload,
+            )
+
+        if mode == "split":
+            split_results: dict[str, Any] = {}
+            splits = self._data_gateway.train_val_test_split()
+            for name in ("train", "val", "test"):
+                split_slice = splits.get(name)
+                if split_slice is None:
+                    continue
+                if split_slice.end_idx <= split_slice.start_idx:
+                    continue
+                res_slice = factors[:, split_slice.start_idx : split_slice.end_idx]
+                result = self._backtest_engine.evaluate(
+                    res_slice,
+                    split_slice.raw_data_cache,
+                    split_slice.target_ret,
+                    return_details=return_details,
+                )
+                split_results[name] = {
+                    "result": result,
+                    "dates": split_slice.dates,
+                }
+            payload["splits"] = split_results
+            return BacktestUseCaseResult(
+                ok=True,
+                message="Split backtest completed.",
+                payload=payload,
+            )
+
+        fold_results: list[dict[str, Any]] = []
+        val_scores: list[float] = []
+        test_scores: list[float] = []
+        folds = self._data_gateway.walk_forward_splits()
+        for idx, fold in enumerate(folds, 1):
+            fold_out: dict[str, Any] = {"index": idx}
+            if fold.val.end_idx > fold.val.start_idx:
+                res_val = factors[:, fold.val.start_idx : fold.val.end_idx]
+                val_result = self._backtest_engine.evaluate(
+                    res_val,
+                    fold.val.raw_data_cache,
+                    fold.val.target_ret,
+                    return_details=return_details,
+                )
+                fold_out["val"] = val_result
+                val_scores.append(float(val_result.score))
+            if fold.test.end_idx > fold.test.start_idx:
+                res_test = factors[:, fold.test.start_idx : fold.test.end_idx]
+                test_result = self._backtest_engine.evaluate(
+                    res_test,
+                    fold.test.raw_data_cache,
+                    fold.test.target_ret,
+                    return_details=return_details,
+                )
+                fold_out["test"] = test_result
+                test_scores.append(float(test_result.score))
+            if "val" in fold_out or "test" in fold_out:
+                fold_results.append(fold_out)
+
+        if not fold_results:
+            payload["folds"] = []
+            return BacktestUseCaseResult(
+                ok=True,
+                message="Walk-forward disabled: not enough data for configured windows.",
+                payload=payload,
+            )
+
+        payload["folds"] = fold_results
+        payload["avg_val_score"] = float(sum(val_scores) / len(val_scores)) if val_scores else None
+        payload["avg_test_score"] = float(sum(test_scores) / len(test_scores)) if test_scores else None
+        return BacktestUseCaseResult(
+            ok=True,
+            message="Walk-forward backtest completed.",
+            payload=payload,
+        )
+```
+
+model_core/application/use_cases/train_alpha.py
+```python
+from __future__ import annotations
+
+from model_core.domain.models import TrainingArtifact
+from model_core.ports.interfaces import TrainerPort
+
+
+class TrainAlphaUseCase:
+    """Application service for model training orchestration."""
+
+    def __init__(self, trainer: TrainerPort):
+        self._trainer = trainer
+
+    def run(self) -> TrainingArtifact:
+        return self._trainer.train()
+
+```
+
 model_core/backtest.py
 ```python
 import math
@@ -872,6 +1773,8 @@ class ChinaBacktest:
         if factors.numel() == 0:
             return BacktestResult(score=torch.tensor(-2.0, device=target_ret.device), mean_return=0.0)
 
+        valid = torch.isfinite(target_ret)
+        valid_f = valid.float()
         signal = torch.tanh(factors)
 
         if self.allow_short:
@@ -883,17 +1786,29 @@ class ChinaBacktest:
             position = torch.roll(position, self.signal_lag, dims=1)
             position[:, : self.signal_lag] = 0.0
 
+        # Do not hold positions when target return is missing.
+        position = position * valid_f
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
+        valid_prev = torch.roll(valid, 1, dims=1)
+        valid_prev[:, 0] = False
+        turnover = turnover * (valid & valid_prev).float()
 
         slippage = self._compute_slippage(turnover, raw_data)
-        pnl = position * target_ret - turnover * self.cost_rate - slippage
+        safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
+        pnl = position * safe_target - turnover * self.cost_rate - slippage
+        pnl = pnl * valid_f
 
-        mu = pnl.mean(dim=1)
-        std = pnl.std(dim=1) + 1e-6
+        valid_count = valid_f.sum(dim=1)
+        has_obs = valid_count > 0
+        valid_count_safe = torch.clamp(valid_count, min=1.0)
 
-        neg_mask = pnl < 0
+        mu = pnl.sum(dim=1) / valid_count_safe
+        centered = (pnl - mu.unsqueeze(1)) * valid_f
+        std = torch.sqrt((centered ** 2).sum(dim=1) / valid_count_safe + 1e-6)
+
+        neg_mask = (pnl < 0) & valid
         neg_count = neg_mask.sum(dim=1)
         downside = torch.where(neg_mask, pnl, torch.zeros_like(pnl))
         down_mean = downside.sum(dim=1) / torch.clamp(neg_count, min=1)
@@ -907,15 +1822,22 @@ class ChinaBacktest:
         sortino = torch.where(mu < 0, torch.full_like(sortino, -2.0), sortino)
         sortino = torch.where(turnover.mean(dim=1) > 0.5, sortino - 1.0, sortino)
         sortino = torch.where(position.abs().sum(dim=1) == 0, torch.full_like(sortino, -2.0), sortino)
+        sortino = torch.where(has_obs, sortino, torch.full_like(sortino, -2.0))
 
         sortino = torch.clamp(sortino, -3.0, 5.0)
         final_fitness = torch.median(sortino)
-        mean_return = pnl.mean(dim=1).mean().item()
+        total_valid = torch.clamp(valid_f.sum(), min=1.0)
+        mean_return = (pnl.sum() / total_valid).item()
 
         if not return_details:
             return BacktestResult(score=final_fitness, mean_return=mean_return)
 
-        portfolio_ret = pnl.mean(dim=0)
+        valid_per_t = valid_f.sum(dim=0)
+        portfolio_ret = torch.where(
+            valid_per_t > 0,
+            pnl.sum(dim=0) / torch.clamp(valid_per_t, min=1.0),
+            torch.zeros_like(valid_per_t),
+        )
         equity_curve = torch.cumprod(torch.clamp(1.0 + portfolio_ret, min=1e-6), dim=0)
         metrics = self._compute_risk_metrics(portfolio_ret, equity_curve, turnover, position)
 
@@ -926,6 +1848,232 @@ class ChinaBacktest:
             equity_curve=equity_curve.detach().cpu(),
             portfolio_returns=portfolio_ret.detach().cpu(),
         )
+```
+
+model_core/bootstrap/__init__.py
+```python
+"""Composition root utilities."""
+
+from .container import LegacyContainer, create_legacy_container
+from .factories import (
+    create_training_engine,
+    create_training_workflow_service,
+    create_training_workflow_service_from_components,
+)
+
+__all__ = [
+    "LegacyContainer",
+    "create_legacy_container",
+    "create_training_engine",
+    "create_training_workflow_service",
+    "create_training_workflow_service_from_components",
+]
+```
+
+model_core/bootstrap/container.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from model_core.application.use_cases import BacktestFormulaUseCase, TrainAlphaUseCase
+from model_core.infrastructure import (
+    ChinaBacktestEngineAdapter,
+    ChinaDataGatewayAdapter,
+    LegacyAlphaTrainer,
+    StackVmFormulaExecutorAdapter,
+)
+from .factories import create_training_workflow_service
+
+
+@dataclass
+class LegacyContainer:
+    """
+    Composition root for the compatibility layer.
+
+    This keeps old implementations but exposes them through explicit ports.
+    """
+
+    data_gateway: ChinaDataGatewayAdapter
+    formula_executor: StackVmFormulaExecutorAdapter
+    backtest_engine: ChinaBacktestEngineAdapter
+    trainer: LegacyAlphaTrainer
+
+    def backtest_use_case(self) -> BacktestFormulaUseCase:
+        return BacktestFormulaUseCase(
+            data_gateway=self.data_gateway,
+            executor=self.formula_executor,
+            backtest_engine=self.backtest_engine,
+        )
+
+    def train_use_case(self) -> TrainAlphaUseCase:
+        return TrainAlphaUseCase(trainer=self.trainer)
+
+
+def create_legacy_container(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+) -> LegacyContainer:
+    return LegacyContainer(
+        data_gateway=ChinaDataGatewayAdapter(),
+        formula_executor=StackVmFormulaExecutorAdapter(),
+        backtest_engine=ChinaBacktestEngineAdapter(),
+        trainer=LegacyAlphaTrainer(
+            use_lord_regularization=use_lord_regularization,
+            lord_decay_rate=lord_decay_rate,
+            lord_num_iterations=lord_num_iterations,
+            workflow_factory=create_training_workflow_service,
+        ),
+    )
+```
+
+model_core/bootstrap/factories.py
+```python
+from __future__ import annotations
+
+from typing import Any, Optional
+from warnings import warn
+
+import torch
+
+from model_core.alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
+from model_core.application.services import TrainingWorkflowService, build_token_tables
+from model_core.backtest import ChinaBacktest
+from model_core.config import ModelConfig
+from model_core.data_loader import ChinaMinuteDataLoader
+from model_core.vm import StackVM
+
+
+def _default_data_kwargs() -> dict[str, Any]:
+    return {
+        "codes": ModelConfig.CN_CODES,
+        "years": ModelConfig.CN_MINUTE_YEARS,
+        "start_date": ModelConfig.CN_MINUTE_START_DATE,
+        "end_date": ModelConfig.CN_MINUTE_END_DATE,
+        "signal_time": ModelConfig.CN_SIGNAL_TIME,
+        "exit_time": ModelConfig.CN_EXIT_TIME,
+        "limit_codes": ModelConfig.CN_MAX_CODES,
+    }
+
+
+def create_training_workflow_service_from_components(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+    loader: Optional[ChinaMinuteDataLoader] = None,
+    model: Optional[AlphaGPT] = None,
+    optimizer=None,
+    vm: Optional[StackVM] = None,
+    backtest: Optional[ChinaBacktest] = None,
+    auto_load_data: bool = True,
+    data_kwargs: Optional[dict[str, Any]] = None,
+) -> TrainingWorkflowService:
+    """Build training workflow from optional runtime components."""
+
+    loader = loader or ChinaMinuteDataLoader()
+    if auto_load_data and loader.feat_tensor is None:
+        loader.load_data(**(data_kwargs or _default_data_kwargs()))
+    if loader.dates is None:
+        raise ValueError("Data not loaded. Provide a loaded loader or enable auto_load_data.")
+
+    model = model or AlphaGPT().to(ModelConfig.DEVICE)
+    optimizer = optimizer or torch.optim.AdamW(model.parameters(), lr=1e-3)
+    vm = vm or StackVM()
+    backtest = backtest or ChinaBacktest()
+    token_arity, token_delta = build_token_tables(
+        vocab_size=model.vocab_size,
+        feat_offset=vm.feat_offset,
+        arity_map=vm.arity_map,
+    )
+
+    use_lord = bool(use_lord_regularization)
+    if use_lord:
+        lord_opt = NewtonSchulzLowRankDecay(
+            model.named_parameters(),
+            decay_rate=lord_decay_rate,
+            num_iterations=lord_num_iterations,
+            target_keywords=["q_proj", "k_proj", "attention", "qk_norm"],
+        )
+        rank_monitor = StableRankMonitor(
+            model,
+            target_keywords=["attention", "in_proj", "out_proj"],
+        )
+    else:
+        lord_opt = None
+        rank_monitor = None
+
+    return TrainingWorkflowService(
+        loader=loader,
+        model=model,
+        optimizer=optimizer,
+        vm=vm,
+        backtest_engine=backtest,
+        bos_id=model.bos_id,
+        token_arity=token_arity.to(ModelConfig.DEVICE),
+        token_delta=token_delta.to(ModelConfig.DEVICE),
+        device=ModelConfig.DEVICE,
+        use_lord=use_lord,
+        lord_opt=lord_opt,
+        rank_monitor=rank_monitor,
+        train_steps=ModelConfig.TRAIN_STEPS,
+        batch_size=ModelConfig.BATCH_SIZE,
+        max_formula_len=ModelConfig.MAX_FORMULA_LEN,
+        ppo_epochs=ModelConfig.PPO_EPOCHS,
+        ppo_clip_eps=ModelConfig.PPO_CLIP_EPS,
+        ppo_value_coef=ModelConfig.PPO_VALUE_COEF,
+        ppo_entropy_coef=ModelConfig.PPO_ENTROPY_COEF,
+        ppo_max_grad_norm=ModelConfig.PPO_MAX_GRAD_NORM,
+        rank_every=100,
+    )
+
+
+def create_training_workflow_service(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+    data_kwargs: Optional[dict[str, Any]] = None,
+) -> TrainingWorkflowService:
+    """Build the application-level training workflow from the composition root."""
+
+    return create_training_workflow_service_from_components(
+        use_lord_regularization=use_lord_regularization,
+        lord_decay_rate=lord_decay_rate,
+        lord_num_iterations=lord_num_iterations,
+        data_kwargs=data_kwargs,
+    )
+
+
+def create_training_engine(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+    data_kwargs: Optional[dict[str, Any]] = None,
+):
+    """
+    Backward-compatible engine factory.
+
+    Prefer `create_training_workflow_service` for new wiring.
+    """
+    warn(
+        "create_training_engine() is deprecated; use create_training_workflow_service() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    from model_core.engine import AlphaEngine
+
+    return AlphaEngine(
+        use_lord_regularization=use_lord_regularization,
+        lord_decay_rate=lord_decay_rate,
+        lord_num_iterations=lord_num_iterations,
+        auto_load_data=True,
+        data_kwargs=data_kwargs,
+    )
 ```
 
 model_core/code_alias.py
@@ -1013,6 +2161,8 @@ class ModelConfig:
     CN_WFO_VAL_DAYS = int(os.getenv("CN_WFO_VAL_DAYS", "20"))
     CN_WFO_TEST_DAYS = int(os.getenv("CN_WFO_TEST_DAYS", "20"))
     CN_WFO_STEP_DAYS = int(os.getenv("CN_WFO_STEP_DAYS", "20"))
+    CN_FEATURE_NORM = os.getenv("CN_FEATURE_NORM", "train").strip().lower()
+    CN_FEATURE_CLIP = float(os.getenv("CN_FEATURE_CLIP", "5.0"))
     _CN_CODES_RAW = os.getenv("CN_CODES", "")
     CN_CODES = [c.strip() for c in _CN_CODES_RAW.split(",") if c.strip()]
     _CN_MINUTE_YEARS_RAW = os.getenv("CN_MINUTE_YEARS", "")
@@ -1067,6 +2217,7 @@ class ChinaMinuteDataLoader:
         self.target_ret: Optional[torch.Tensor] = None
         self.dates: Optional[pd.DatetimeIndex] = None
         self.symbols: Optional[list[str]] = None
+        self.feature_norm_info: dict[str, int | str | float] = {}
         alias_path = Path(ModelConfig.CN_CODE_ALIAS_FILE)
         if not alias_path.is_absolute():
             alias_path = self.data_root.parent / alias_path
@@ -1206,6 +2357,80 @@ class ChinaMinuteDataLoader:
             val = max(0, total_len - train)
         test = max(0, total_len - train - val)
         return train, val, test
+
+    def _validate_split_order(
+        self,
+        dates: pd.DatetimeIndex,
+        train_len: int,
+        val_len: int,
+        test_len: int,
+    ) -> None:
+        if len(dates) == 0:
+            return
+        if not dates.is_monotonic_increasing:
+            raise ValueError("Date index is not sorted ascending.")
+        if train_len + val_len + test_len > len(dates):
+            raise ValueError("Split sizes exceed available data length.")
+
+        # Hard check: train < val < test chronological boundary.
+        if train_len > 0 and val_len > 0:
+            if dates[train_len - 1] >= dates[train_len]:
+                raise ValueError("Split order invalid: train end must be earlier than val start.")
+        if val_len > 0 and test_len > 0:
+            boundary = train_len + val_len
+            if dates[boundary - 1] >= dates[boundary]:
+                raise ValueError("Split order invalid: val end must be earlier than test start.")
+        if val_len == 0 and train_len > 0 and test_len > 0:
+            boundary = train_len
+            if dates[boundary - 1] >= dates[boundary]:
+                raise ValueError("Split order invalid: train end must be earlier than test start.")
+
+    def _validate_target_ret_mask(self, target_df: pd.DataFrame, target_tensor: torch.Tensor) -> None:
+        expected_nan = torch.tensor(
+            target_df.isna().to_numpy().T,
+            dtype=torch.bool,
+            device=target_tensor.device,
+        )
+        actual_nan = torch.isnan(target_tensor)
+        if not torch.equal(expected_nan, actual_nan):
+            raise ValueError("target_ret NaN mask changed after tensor conversion.")
+
+        # Hard check: missing target entries must not be copied from previous day.
+        for col_idx, col in enumerate(target_df.columns):
+            series = target_df[col]
+            missing_idx = series.index[series.isna()]
+            if len(missing_idx) == 0:
+                continue
+            pos = int(target_df.index.get_loc(missing_idx[0]))
+            if pos == 0:
+                continue
+            prev = series.iloc[pos - 1]
+            if pd.isna(prev):
+                continue
+            cur = target_tensor[col_idx, pos]
+            if torch.isfinite(cur):
+                if abs(float(cur.item()) - float(prev)) < 1e-12:
+                    raise ValueError(f"target_ret forward-fill detected for {col}.")
+
+    def _normalize_features(self, raw_feat: torch.Tensor, train_len: int) -> torch.Tensor:
+        mode = ModelConfig.CN_FEATURE_NORM
+        clip = ModelConfig.CN_FEATURE_CLIP
+        total_len = raw_feat.shape[2]
+
+        if mode == "none":
+            self.feature_norm_info = {"mode": "none", "fit_len": 0, "clip": clip}
+            return raw_feat
+        if mode != "train":
+            raise ValueError(f"Unsupported CN_FEATURE_NORM={mode}; expected 'none' or 'train'.")
+        if train_len <= 0:
+            raise ValueError("CN_FEATURE_NORM=train requires a non-empty train split.")
+        if train_len > total_len:
+            raise ValueError("Train split exceeds feature timeline length.")
+
+        train_feat = raw_feat[:, :, :train_len]
+        norm_stats = FeatureEngineer.fit_robust_stats(train_feat)
+        self.feature_norm_info = {"mode": "train", "fit_len": train_len, "clip": clip}
+        return FeatureEngineer.apply_robust_norm(raw_feat, norm_stats=norm_stats, clip=clip)
 
     def _slice_raw_data(self, start: int, end: int) -> dict[str, torch.Tensor]:
         if self.raw_data_cache is None:
@@ -1362,30 +2587,47 @@ class ChinaMinuteDataLoader:
                     frame = frame.iloc[-cutoff_days:]
                 per_code_frames[code] = frame
 
-        def build_pivot(field: str) -> pd.DataFrame:
+        def build_pivot(
+            field: str,
+            *,
+            ffill: bool = True,
+            fill_value: Optional[float] = 0.0,
+        ) -> pd.DataFrame:
             series_list = []
             for code, frame in per_code_frames.items():
                 s = frame.set_index("date")[field].rename(code)
                 series_list.append(s)
             pivot = pd.concat(series_list, axis=1).sort_index()
-            pivot = pivot.ffill().fillna(0.0)
+            if ffill:
+                pivot = pivot.ffill()
+            if fill_value is not None:
+                pivot = pivot.fillna(fill_value)
             return pivot
 
-        open_df = build_pivot("open")
-        high_df = build_pivot("high")
-        low_df = build_pivot("low")
-        close_df = build_pivot("close")
-        volume_df = build_pivot("volume")
-        amount_df = build_pivot("amount")
-        target_df = build_pivot("target_ret")
-        adj_df = build_pivot("adj_factor") if ModelConfig.CN_USE_ADJ_FACTOR else None
+        open_df = build_pivot("open", ffill=True, fill_value=0.0)
+        high_df = build_pivot("high", ffill=True, fill_value=0.0)
+        low_df = build_pivot("low", ffill=True, fill_value=0.0)
+        close_df = build_pivot("close", ffill=True, fill_value=0.0)
+        volume_df = build_pivot("volume", ffill=False, fill_value=0.0)
+        amount_df = build_pivot("amount", ffill=False, fill_value=0.0)
+        target_df = build_pivot("target_ret", ffill=False, fill_value=None)
+        adj_df = (
+            build_pivot("adj_factor", ffill=True, fill_value=1.0)
+            if ModelConfig.CN_USE_ADJ_FACTOR
+            else None
+        )
 
         index = close_df.index
         columns = close_df.columns
+        train_len, val_len, test_len = self._resolve_split_sizes(len(index))
+        self._validate_split_order(index, train_len, val_len, test_len)
 
         def to_tensor(pivot: pd.DataFrame) -> torch.Tensor:
             pivot = pivot.reindex(index=index, columns=columns)
             return torch.tensor(pivot.values.T, dtype=torch.float32, device=ModelConfig.DEVICE)
+
+        target_tensor = to_tensor(target_df)
+        self._validate_target_ret_mask(target_df, target_tensor)
 
         self.raw_data_cache = {
             "open": to_tensor(open_df),
@@ -1400,395 +2642,296 @@ class ChinaMinuteDataLoader:
         if adj_df is not None:
             self.raw_data_cache["adj_factor"] = to_tensor(adj_df)
 
-        self.feat_tensor = FeatureEngineer.compute_features(self.raw_data_cache)
-        self.target_ret = to_tensor(target_df)
+        raw_feat = FeatureEngineer.compute_features(self.raw_data_cache, normalize=False)
+        self.feat_tensor = self._normalize_features(raw_feat, train_len=train_len)
+        self.target_ret = target_tensor
         self.dates = index
         self.symbols = list(columns)
 
         print(f"CN Minute Data Ready. Shape: {self.feat_tensor.shape}")
+        if self.feature_norm_info:
+            print(
+                "[norm] mode={mode} fit_len={fit_len} clip={clip}".format(
+                    mode=self.feature_norm_info.get("mode"),
+                    fit_len=self.feature_norm_info.get("fit_len"),
+                    clip=self.feature_norm_info.get("clip"),
+                )
+            )
+```
+
+model_core/domain/__init__.py
+```python
+"""Domain models shared across application and infrastructure layers."""
+
+from .models import (
+    BacktestEvaluation,
+    DataBundle,
+    DatasetSlice,
+    Formula,
+    TrainingArtifact,
+    WalkForwardBundle,
+)
+
+__all__ = [
+    "BacktestEvaluation",
+    "DataBundle",
+    "DatasetSlice",
+    "Formula",
+    "TrainingArtifact",
+    "WalkForwardBundle",
+]
+```
+
+model_core/domain/models.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import pandas as pd
+import torch
+
+Formula = list[int]
+
+
+@dataclass
+class DataBundle:
+    """Canonical in-memory market data payload."""
+
+    feat_tensor: torch.Tensor
+    raw_data_cache: dict[str, torch.Tensor]
+    target_ret: torch.Tensor
+    dates: pd.DatetimeIndex
+    symbols: list[str]
+
+
+@dataclass
+class DatasetSlice:
+    """Windowed view over the canonical market payload."""
+
+    feat_tensor: torch.Tensor
+    raw_data_cache: dict[str, torch.Tensor]
+    target_ret: torch.Tensor
+    dates: pd.DatetimeIndex
+    symbols: list[str]
+    start_idx: int
+    end_idx: int
+
+
+@dataclass
+class WalkForwardBundle:
+    """One walk-forward fold containing train/val/test windows."""
+
+    train: DatasetSlice
+    val: DatasetSlice
+    test: DatasetSlice
+
+
+@dataclass
+class TrainingArtifact:
+    """Minimal training output used by application use-cases."""
+
+    best_formula: Optional[Formula]
+    best_score: float
+    strategy_path: Optional[str] = None
+
+
+@dataclass
+class BacktestEvaluation:
+    """Serializable backtest result returned by application ports."""
+
+    score: float
+    mean_return: float
+    metrics: Optional[dict[str, float]] = None
+    equity_curve: Optional[list[float]] = None
+    portfolio_returns: Optional[list[float]] = None
 ```
 
 model_core/engine.py
 ```python
-from typing import Optional, Any
-import json
+from __future__ import annotations
 
-import torch
-import torch.nn.functional as F
-from torch.distributions import Categorical
+from typing import Any, Optional
+from warnings import warn
+
 from tqdm import tqdm
 
+from .application.services import TrainingWorkflowService
+from .bootstrap.factories import create_training_workflow_service_from_components
 from .config import ModelConfig
-from .data_loader import ChinaMinuteDataLoader
-from .alphagpt import AlphaGPT, NewtonSchulzLowRankDecay, StableRankMonitor
-from .vm import StackVM
-from .backtest import ChinaBacktest
 
 
 class AlphaEngine:
     """
-    Core training engine for AlphaGPT on A-share minute data.
+    Compatibility facade over application-level training workflow.
+
+    Deprecated path: prefer wiring through `TrainAlphaUseCase`.
     """
 
-    def __init__(self, use_lord_regularization: bool = True,
-                 lord_decay_rate: float = 1e-3,
-                 lord_num_iterations: int = 5):
-        self.loader = ChinaMinuteDataLoader()
-        self.loader.load_data(
-            codes=ModelConfig.CN_CODES,
-            years=ModelConfig.CN_MINUTE_YEARS,
-            start_date=ModelConfig.CN_MINUTE_START_DATE,
-            end_date=ModelConfig.CN_MINUTE_END_DATE,
-            signal_time=ModelConfig.CN_SIGNAL_TIME,
-            exit_time=ModelConfig.CN_EXIT_TIME,
-            limit_codes=ModelConfig.CN_MAX_CODES,
+    def __init__(
+        self,
+        use_lord_regularization: bool = True,
+        lord_decay_rate: float = 1e-3,
+        lord_num_iterations: int = 5,
+        *,
+        workflow: Optional[TrainingWorkflowService] = None,
+        loader=None,
+        model=None,
+        optimizer=None,
+        vm=None,
+        backtest=None,
+        auto_load_data: bool = True,
+        data_kwargs: Optional[dict[str, Any]] = None,
+    ):
+        warn(
+            "AlphaEngine is a compatibility wrapper; prefer application/use_cases APIs.",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
-        self.model = AlphaGPT().to(ModelConfig.DEVICE)
-        self.opt = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
-
-        self.use_lord = use_lord_regularization
-        if self.use_lord:
-            self.lord_opt: Optional[NewtonSchulzLowRankDecay] = NewtonSchulzLowRankDecay(
-                self.model.named_parameters(),
-                decay_rate=lord_decay_rate,
-                num_iterations=lord_num_iterations,
-                target_keywords=["q_proj", "k_proj", "attention", "qk_norm"],
-            )
-            self.rank_monitor: Optional[StableRankMonitor] = StableRankMonitor(
-                self.model,
-                target_keywords=["attention", "in_proj", "out_proj"],
-            )
+        if workflow is not None:
+            self.workflow = workflow
         else:
-            self.lord_opt = None
-            self.rank_monitor = None
+            self.workflow = create_training_workflow_service_from_components(
+                use_lord_regularization=use_lord_regularization,
+                lord_decay_rate=lord_decay_rate,
+                lord_num_iterations=lord_num_iterations,
+                loader=loader,
+                model=model,
+                optimizer=optimizer,
+                vm=vm,
+                backtest=backtest,
+                auto_load_data=auto_load_data,
+                data_kwargs=data_kwargs,
+            )
 
-        self.vm = StackVM()
-        self.bt = ChinaBacktest()
-        self.feat_offset = self.vm.feat_offset
-        self.vocab_size = self.model.vocab_size
-        self.bos_id = self.model.bos_id
-        self.token_arity = self._build_token_arity().to(ModelConfig.DEVICE)
-        self.token_delta = self._build_token_delta().to(ModelConfig.DEVICE)
+        # Compatibility attributes exposed for older callers.
+        self.loader = self.workflow.loader
+        self.model = self.workflow.model
+        self.opt = self.workflow.optimizer
+        self.vm = self.workflow.vm
+        self.bt = self.workflow.backtest_engine
+        self.token_arity = self.workflow.token_arity
+        self.token_delta = self.workflow.token_delta
+        self.lord_opt = self.workflow.lord_opt
+        self.rank_monitor = self.workflow.rank_monitor
+        self.use_lord = self.workflow.use_lord
 
-        self.splits = self.loader.train_val_test_split()
-        self.train_slice = self.splits.get("train")
-        self.val_slice = self.splits.get("val")
-        self.test_slice = self.splits.get("test")
-        self.walk_forward_folds = self.loader.walk_forward_splits() if ModelConfig.CN_WALK_FORWARD else []
-        self.use_wfo = ModelConfig.CN_WALK_FORWARD and len(self.walk_forward_folds) > 0
-
-        self.best_score: float = -float('inf')
+        self.best_score: float = -float("inf")
         self.best_formula: Optional[list[int]] = None
-
         self.training_history: dict[str, list[Any]] = {
-            'step': [],
-            'avg_reward': [],
-            'best_score': [],
-            'stable_rank': [],
-            'avg_val_score': [],
-            'policy_loss': [],
-            'value_loss': [],
-            'entropy': [],
+            "step": [],
+            "avg_reward": [],
+            "best_score": [],
+            "stable_rank": [],
+            "avg_val_score": [],
+            "policy_loss": [],
+            "value_loss": [],
+            "entropy": [],
         }
 
-    def _build_token_arity(self) -> torch.Tensor:
-        token_arity = torch.zeros(self.vocab_size, dtype=torch.long)
-        # Default to "always legal" for feature tokens.
-        token_arity[: self.feat_offset] = 0
-        # Fill operator arity from VM definition.
-        for token, arity in self.vm.arity_map.items():
-            if 0 <= token < self.vocab_size:
-                token_arity[token] = int(arity)
-        return token_arity
-
-    def _build_token_delta(self) -> torch.Tensor:
-        # Feature token pushes one tensor onto stack.
-        token_delta = torch.ones(self.vocab_size, dtype=torch.long)
-        # Operator pops `arity`, then pushes one result => delta = 1 - arity.
-        for token, arity in self.vm.arity_map.items():
-            if 0 <= token < self.vocab_size:
-                token_delta[token] = 1 - int(arity)
-        return token_delta
-
-    def _legal_action_mask(self, stack_depth: torch.Tensor, remaining_steps: int) -> torch.Tensor:
-        # A token is legal iff current depth >= token arity (no underflow).
-        legal = stack_depth.unsqueeze(1) >= self.token_arity.unsqueeze(0)
-        next_depth = stack_depth.unsqueeze(1) + self.token_delta.unsqueeze(0)
-        # Keep only actions that can still finish with stack depth 1.
-        if remaining_steps > 1:
-            legal = legal & (next_depth <= remaining_steps)
-        else:
-            legal = legal & (next_depth == 1)
-        legal[:, self.bos_id] = False
-        return legal
-
     def train(self) -> None:
-        print("🚀 Starting Alpha Mining with PPO + LoRD..." if self.use_lord else "🚀 Starting Alpha Mining with PPO...")
+        print(
+            "🚀 Starting Alpha Mining with PPO + LoRD..."
+            if self.use_lord
+            else "🚀 Starting Alpha Mining with PPO..."
+        )
         if self.use_lord:
             print("   LoRD Regularization enabled")
             print("   Target keywords: ['q_proj', 'k_proj', 'attention', 'qk_norm']")
-        if self.use_wfo:
-            print(f"   Walk-forward validation: {len(self.walk_forward_folds)} folds")
-        elif self.train_slice:
-            print(f"   Train window: {self.train_slice.dates.min()} -> {self.train_slice.dates.max()}")
-            if self.val_slice:
-                print(f"   Val window:   {self.val_slice.dates.min()} -> {self.val_slice.dates.max()}")
-            if self.test_slice:
-                print(f"   Test window:  {self.test_slice.dates.min()} -> {self.test_slice.dates.max()}")
+        for line in self.workflow.train_window_descriptions():
+            print(line)
 
-        pbar = tqdm(range(ModelConfig.TRAIN_STEPS))
-        full_feat = self.loader.feat_tensor
-        if full_feat is None or self.loader.raw_data_cache is None or self.loader.target_ret is None:
-            raise ValueError("Data not loaded. Check data loader.")
+        def _on_new_best(score: float, mean_return: float, formula: list[int]) -> None:
+            tqdm.write(f"[!] New King: Score {score:.2f} | Ret {mean_return:.2%} | Formula {formula}")
 
-        for step in pbar:
-            bs = ModelConfig.BATCH_SIZE
-            inp = torch.full((bs, 1), self.bos_id, dtype=torch.long, device=ModelConfig.DEVICE)
-            stack_depth = torch.zeros(bs, dtype=torch.long, device=ModelConfig.DEVICE)
+        result = self.workflow.run(
+            strategy_path=ModelConfig.STRATEGY_FILE,
+            history_path="training_history.json",
+            on_new_best=_on_new_best,
+        )
 
-            old_log_probs: list[torch.Tensor] = []
-            old_values_steps: list[torch.Tensor] = []
-            tokens_list: list[torch.Tensor] = []
-            stack_depth_steps: list[torch.Tensor] = []
-
-            for t in range(ModelConfig.MAX_FORMULA_LEN):
-                logits, value_t, _ = self.model(inp)
-                stack_depth_steps.append(stack_depth.clone())
-                old_values_steps.append(value_t.squeeze(-1).detach())
-                remaining_steps = ModelConfig.MAX_FORMULA_LEN - t
-                legal_mask = self._legal_action_mask(stack_depth, remaining_steps)
-                masked_logits = logits.masked_fill(~legal_mask, -1e9)
-                dist = Categorical(logits=masked_logits)
-                action = dist.sample()
-
-                old_log_probs.append(dist.log_prob(action).detach())
-                tokens_list.append(action)
-                stack_depth = stack_depth + self.token_delta[action]
-                inp = torch.cat([inp, action.unsqueeze(1)], dim=1)
-
-            seqs = torch.stack(tokens_list, dim=1)
-            rollout_inputs = inp.detach()
-            old_log_probs_tensor = torch.stack(old_log_probs, dim=1).detach()
-            old_values = torch.stack(old_values_steps, dim=1)
-
-            rewards = torch.zeros(bs, device=ModelConfig.DEVICE)
-            val_scores: list[float] = []
-
-            for i in range(bs):
-                formula = seqs[i].tolist()
-
-                res = self.vm.execute(formula, full_feat)
-                if res is None:
-                    rewards[i] = -5.0
-                    continue
-
-                if res.std() < 1e-4:
-                    rewards[i] = -2.0
-                    continue
-
-                ret_val = 0.0
-                selection_score = None
-
-                if self.use_wfo:
-                    fold_scores = []
-                    fold_returns = []
-                    for fold in self.walk_forward_folds:
-                        if fold.val.end_idx <= fold.val.start_idx:
-                            continue
-                        res_val = res[:, fold.val.start_idx:fold.val.end_idx]
-                        if res_val.numel() == 0:
-                            continue
-                        result = self.bt.evaluate(res_val, fold.val.raw_data_cache, fold.val.target_ret)
-                        fold_scores.append(result.score)
-                        fold_returns.append(result.mean_return)
-                    if not fold_scores:
-                        rewards[i] = -2.0
-                        continue
-                    reward = torch.stack(fold_scores).mean()
-                    rewards[i] = reward
-                    selection_score = reward
-                    ret_val = float(sum(fold_returns) / len(fold_returns))
-                else:
-                    train_slice = self.train_slice
-                    if train_slice is None:
-                        train_slice = self.loader.get_slice(0, res.shape[1])
-                    res_train = res[:, train_slice.start_idx:train_slice.end_idx]
-                    if res_train.std() < 1e-4:
-                        rewards[i] = -2.0
-                        continue
-                    train_result = self.bt.evaluate(
-                        res_train,
-                        train_slice.raw_data_cache,
-                        train_slice.target_ret,
-                    )
-                    rewards[i] = train_result.score
-                    selection_score = train_result.score
-                    ret_val = train_result.mean_return
-
-                    if self.val_slice and self.val_slice.end_idx > self.val_slice.start_idx:
-                        res_val = res[:, self.val_slice.start_idx:self.val_slice.end_idx]
-                        if res_val.numel() > 0:
-                            val_result = self.bt.evaluate(
-                                res_val,
-                                self.val_slice.raw_data_cache,
-                                self.val_slice.target_ret,
-                            )
-                            selection_score = val_result.score
-                            ret_val = val_result.mean_return
-                            val_scores.append(val_result.score.item())
-
-                if selection_score is not None and selection_score.item() > self.best_score:
-                    self.best_score = selection_score.item()
-                    self.best_formula = formula
-                    tqdm.write(f"[!] New King: Score {selection_score:.2f} | Ret {ret_val:.2%} | Formula {formula}")
-
-            returns = torch.nan_to_num(rewards.detach(), nan=-2.0, posinf=5.0, neginf=-5.0)
-            returns_steps = returns.unsqueeze(1).expand(-1, ModelConfig.MAX_FORMULA_LEN)
-            advantages = returns_steps - old_values
-            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-5)
-            advantages = advantages.detach()
-
-            policy_loss_value = float("nan")
-            value_loss_value = float("nan")
-            entropy_value = float("nan")
-
-            for _ in range(max(1, ModelConfig.PPO_EPOCHS)):
-                new_log_probs_steps: list[torch.Tensor] = []
-                values_pred_steps: list[torch.Tensor] = []
-                entropy_steps: list[torch.Tensor] = []
-
-                for t in range(ModelConfig.MAX_FORMULA_LEN):
-                    prefix = rollout_inputs[:, : t + 1]
-                    logits_t, value_t, _ = self.model(prefix)
-                    remaining_steps = ModelConfig.MAX_FORMULA_LEN - t
-                    legal_mask_t = self._legal_action_mask(stack_depth_steps[t], remaining_steps)
-                    masked_logits_t = logits_t.masked_fill(~legal_mask_t, -1e9)
-                    dist_t = Categorical(logits=masked_logits_t)
-                    actions_t = seqs[:, t]
-                    new_log_probs_steps.append(dist_t.log_prob(actions_t))
-                    values_pred_steps.append(value_t.squeeze(-1))
-                    entropy_steps.append(dist_t.entropy())
-
-                new_log_probs = torch.stack(new_log_probs_steps, dim=1)
-                ratio = torch.exp(new_log_probs - old_log_probs_tensor)
-
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(
-                    ratio,
-                    1.0 - ModelConfig.PPO_CLIP_EPS,
-                    1.0 + ModelConfig.PPO_CLIP_EPS,
-                ) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-
-                values_pred = torch.stack(values_pred_steps, dim=1)
-                value_loss = F.mse_loss(values_pred, returns_steps)
-
-                entropy_bonus = torch.stack(entropy_steps, dim=1).mean()
-                loss = (
-                    policy_loss
-                    + ModelConfig.PPO_VALUE_COEF * value_loss
-                    - ModelConfig.PPO_ENTROPY_COEF * entropy_bonus
-                )
-
-                self.opt.zero_grad()
-                loss.backward()
-                if ModelConfig.PPO_MAX_GRAD_NORM > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), ModelConfig.PPO_MAX_GRAD_NORM)
-                self.opt.step()
-
-                if self.use_lord and self.lord_opt:
-                    self.lord_opt.step()
-
-                policy_loss_value = policy_loss.item()
-                value_loss_value = value_loss.item()
-                entropy_value = entropy_bonus.item()
-
-            avg_reward = rewards.mean().item()
-            postfix_dict = {'AvgRew': f"{avg_reward:.3f}", 'BestScore': f"{self.best_score:.3f}"}
-            postfix_dict['PLoss'] = f"{policy_loss_value:.3f}"
-            postfix_dict['VLoss'] = f"{value_loss_value:.3f}"
-
-            if self.use_lord and self.rank_monitor and step % 100 == 0:
-                stable_rank = self.rank_monitor.compute()
-                postfix_dict['Rank'] = f"{stable_rank:.2f}"
-                self.training_history['stable_rank'].append(stable_rank)
-            if val_scores:
-                avg_val = float(sum(val_scores) / len(val_scores))
-                postfix_dict['Val'] = f"{avg_val:.3f}"
-                self.training_history['avg_val_score'].append(avg_val)
-            else:
-                self.training_history['avg_val_score'].append(float("nan"))
-
-            self.training_history['step'].append(step)
-            self.training_history['avg_reward'].append(avg_reward)
-            self.training_history['best_score'].append(self.best_score)
-            self.training_history['policy_loss'].append(policy_loss_value)
-            self.training_history['value_loss'].append(value_loss_value)
-            self.training_history['entropy'].append(entropy_value)
-
-            pbar.set_postfix(postfix_dict)
-
-        with open(ModelConfig.STRATEGY_FILE, "w") as f:
-            json.dump(self.best_formula, f)
-
-        with open("training_history.json", "w") as f:
-            json.dump(self.training_history, f)
+        self.best_score = result.best_score
+        self.best_formula = result.best_formula
+        self.training_history = result.history
 
         print("\n✓ Training completed!")
         print(f"  Best score: {self.best_score:.4f}")
         print(f"  Best formula: {self.best_formula}")
+        for snapshot in result.evaluations:
+            print(
+                f"  {snapshot.label}: Score {snapshot.score:.4f} | "
+                f"MeanRet {snapshot.mean_return:.2%} | Sharpe {snapshot.sharpe:.2f} | "
+                f"MaxDD {snapshot.max_drawdown:.2%}"
+            )
+```
 
-        if self.best_formula and not self.use_wfo:
-            res = self.vm.execute(self.best_formula, full_feat)
-            if res is not None:
-                def _print_eval(label: str, result) -> None:
-                    metrics = result.metrics or {}
-                    sharpe = metrics.get("sharpe", float("nan"))
-                    max_dd = metrics.get("max_drawdown", float("nan"))
-                    print(f"  {label}: Score {result.score.item():.4f} | MeanRet {result.mean_return:.2%} | Sharpe {sharpe:.2f} | MaxDD {max_dd:.2%}")
+model_core/entrypoints.py
+```python
+from __future__ import annotations
 
-                if self.train_slice:
-                    train_res = res[:, self.train_slice.start_idx:self.train_slice.end_idx]
-                    train_result = self.bt.evaluate(
-                        train_res,
-                        self.train_slice.raw_data_cache,
-                        self.train_slice.target_ret,
-                        return_details=True,
-                    )
-                    _print_eval("Train", train_result)
-                if self.val_slice:
-                    val_res = res[:, self.val_slice.start_idx:self.val_slice.end_idx]
-                    val_result = self.bt.evaluate(
-                        val_res,
-                        self.val_slice.raw_data_cache,
-                        self.val_slice.target_ret,
-                        return_details=True,
-                    )
-                    _print_eval("Val", val_result)
-                if self.test_slice:
-                    test_res = res[:, self.test_slice.start_idx:self.test_slice.end_idx]
-                    test_result = self.bt.evaluate(
-                        test_res,
-                        self.test_slice.raw_data_cache,
-                        self.test_slice.target_ret,
-                        return_details=True,
-                    )
-                    _print_eval("Test", test_result)
+from model_core.bootstrap.container import LegacyContainer
+from model_core.bootstrap import create_legacy_container
+from model_core.application.use_cases import BacktestFormulaUseCase, TrainAlphaUseCase
+
+
+def create_app_container(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+) -> LegacyContainer:
+    """Composition-root helper for new use-case based integration."""
+
+    return create_legacy_container(
+        use_lord_regularization=use_lord_regularization,
+        lord_decay_rate=lord_decay_rate,
+        lord_num_iterations=lord_num_iterations,
+    )
+
+
+def create_train_use_case(
+    *,
+    use_lord_regularization: bool = True,
+    lord_decay_rate: float = 1e-3,
+    lord_num_iterations: int = 5,
+) -> tuple[TrainAlphaUseCase, LegacyContainer]:
+    """Create training use-case with wired dependencies."""
+
+    container = create_app_container(
+        use_lord_regularization=use_lord_regularization,
+        lord_decay_rate=lord_decay_rate,
+        lord_num_iterations=lord_num_iterations,
+    )
+    return container.train_use_case(), container
+
+
+def create_backtest_use_case() -> tuple[BacktestFormulaUseCase, LegacyContainer]:
+    """Create backtest use-case with wired dependencies."""
+
+    container = create_app_container()
+    return container.backtest_use_case(), container
 ```
 
 model_core/factors.py
 ```python
 import torch
 import pandas as pd
+from typing import Optional
 
 try:
     import pandas_ta as ta
-except ImportError as exc:
-    raise ImportError(
-        "pandas_ta is required for feature generation. "
-        "Install with `conda install -c conda-forge pandas-ta`."
-    ) from exc
+    if not hasattr(ta, "Strategy"):
+        raise ImportError("pandas_ta package does not provide Strategy API")
+except ImportError:
+    try:
+        import pandas_ta_classic as ta
+    except ImportError as exc:
+        raise ImportError(
+            "pandas_ta Strategy API is required for feature generation. "
+            "Install with `pip install pandas-ta-classic` or a compatible pandas_ta build."
+        ) from exc
 
 class FeatureEngineer:
     """Feature engineer for China A-share/ETF data using pandas_ta."""
@@ -1828,17 +2971,38 @@ class FeatureEngineer:
     INPUT_DIM = len(FEATURES)
 
     @staticmethod
-    def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
-        """Robust Z-Score Normalization (Cross-Sectional or Time-Series)."""
-        # Normalize along the last axis (time axis).
-        # Works for both [Batch, Time] and [Asset, Feature, Time].
+    def fit_robust_stats(t: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Fit robust normalization stats along time axis."""
         median = torch.nanmedian(t, dim=-1, keepdim=True)[0]
         mad = torch.nanmedian(torch.abs(t - median), dim=-1, keepdim=True)[0] + 1e-6
+        return {"median": median, "mad": mad}
+
+    @staticmethod
+    def apply_robust_norm(
+        t: torch.Tensor,
+        norm_stats: Optional[dict[str, torch.Tensor]] = None,
+        clip: float = 5.0,
+    ) -> torch.Tensor:
+        """Apply robust z-score using provided stats or self-fitted stats."""
+        stats = norm_stats or FeatureEngineer.fit_robust_stats(t)
+        median = stats["median"]
+        mad = stats["mad"]
         norm = (t - median) / mad
         return torch.clamp(norm, -clip, clip)
 
     @staticmethod
-    def compute_features(raw_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
+        """Backward-compatible robust normalization helper."""
+        return FeatureEngineer.apply_robust_norm(t, norm_stats=None, clip=clip)
+
+    @staticmethod
+    def compute_features(
+        raw_dict: dict[str, torch.Tensor],
+        *,
+        normalize: bool = True,
+        norm_stats: Optional[dict[str, torch.Tensor]] = None,
+        clip: float = 5.0,
+    ) -> torch.Tensor:
         """
         Compute features using pandas_ta.
         
@@ -1888,12 +3052,6 @@ class FeatureEngineer:
         CustomStrategy = ta.Strategy(
             name="AlphaGPT Strategy",
             ta=[
-                # Price Transform
-                {"kind": "avgprice"},
-                {"kind": "medprice"},
-                {"kind": "typprice"},
-                {"kind": "wclose"}, # requires OHLC
-                
                 # Returns
                 {"kind": "log_return", "cumulative": False},
                 {"kind": "percent_return", "length": 1},
@@ -1934,7 +3092,7 @@ class FeatureEngineer:
                 {"kind": "bbands", "length": 20},
                 {"kind": "midpoint"},
                 {"kind": "midprice"},
-                {"kind": "sar"},
+                {"kind": "psar"},
                 
                 # Volume
                 {"kind": "obv"},
@@ -1987,10 +3145,10 @@ class FeatureEngineer:
             feat_dict['AMOUNT'] = amounts[:, i] # Raw passed through
             
             # 2. Transformed Prices
-            feat_dict['AVGPRICE'] = get_col(["AVGPRICE"])
-            feat_dict['MEDPRICE'] = get_col(["MEDPRICE"])
-            feat_dict['TYPPRICE'] = get_col(["TYPPRICE"])
-            feat_dict['WCLOSE'] = get_col(["HLC3", "WCP"]) 
+            feat_dict['AVGPRICE'] = (df['open'].values + df['high'].values + df['low'].values + df['close'].values) / 4.0
+            feat_dict['MEDPRICE'] = (df['high'].values + df['low'].values) / 2.0
+            feat_dict['TYPPRICE'] = (df['high'].values + df['low'].values + df['close'].values) / 3.0
+            feat_dict['WCLOSE'] = (df['high'].values + df['low'].values + 2.0 * df['close'].values) / 4.0
             
             # 3. Returns
             feat_dict['RET'] = get_col(["PCTRET_1"])
@@ -2043,7 +3201,15 @@ class FeatureEngineer:
             
             feat_dict['MIDPOINT'] = get_col(["MIDPOINT_2"])
             feat_dict['MIDPRICE'] = get_col(["MIDPRICE_2"])
-            feat_dict['SAR'] = get_col(["SAR"])
+            if "PSARl_0.02_0.2" in df.columns and "PSARs_0.02_0.2" in df.columns:
+                sar_series = df["PSARl_0.02_0.2"].combine_first(df["PSARs_0.02_0.2"]).fillna(0.0)
+                feat_dict['SAR'] = sar_series.values
+            elif "PSARl_0.02_0.2" in df.columns:
+                feat_dict['SAR'] = df["PSARl_0.02_0.2"].fillna(0.0).values
+            elif "PSARs_0.02_0.2" in df.columns:
+                feat_dict['SAR'] = df["PSARs_0.02_0.2"].fillna(0.0).values
+            else:
+                feat_dict['SAR'] = get_col(["SAR"])
             
             # 7. Volume
             feat_dict['OBV'] = get_col(["OBV"])
@@ -2055,7 +3221,7 @@ class FeatureEngineer:
             # custom volume features not in pandas_ta strategy explicitly or need custom calc
             # V_RET
             v_curr = df['volume'].values
-            v_prev = pd.Series(v_curr).shift(1).fillna(method='bfill').values
+            v_prev = pd.Series(v_curr).shift(1).bfill().values
             feat_dict['V_RET'] = (v_curr / (v_prev + 1e-6)) - 1.0
             
             # VOL MA
@@ -2075,12 +3241,285 @@ class FeatureEngineer:
         # Post-process: NaN handling & Normalization
         feat_out = torch.nan_to_num(feat_out, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Apply Robust Normalization to everything?
-        # Yes, AlphaGPT expects roughly standard normal inputs.
-        # But we do this across Time per Asset (Time-Series Norm)
-        normalized = FeatureEngineer.robust_norm(feat_out)
-        
-        return normalized
+        if not normalize:
+            return feat_out
+
+        # Keep normalization optional so caller can avoid train/val leakage.
+        return FeatureEngineer.apply_robust_norm(feat_out, norm_stats=norm_stats, clip=clip)
+```
+
+model_core/infrastructure/__init__.py
+```python
+"""Infrastructure implementations."""
+
+from .adapters import (
+    ChinaBacktestEngineAdapter,
+    ChinaDataGatewayAdapter,
+    LegacyAlphaTrainer,
+    StackVmFormulaExecutorAdapter,
+)
+
+__all__ = [
+    "ChinaBacktestEngineAdapter",
+    "ChinaDataGatewayAdapter",
+    "LegacyAlphaTrainer",
+    "StackVmFormulaExecutorAdapter",
+]
+```
+
+model_core/infrastructure/adapters/__init__.py
+```python
+"""Primary infrastructure adapters for application ports."""
+
+from .backtest_engine import ChinaBacktestEngineAdapter
+from .data_gateway import ChinaDataGatewayAdapter
+from .formula_executor import StackVmFormulaExecutorAdapter
+from .trainer import LegacyAlphaTrainer
+
+__all__ = [
+    "ChinaBacktestEngineAdapter",
+    "ChinaDataGatewayAdapter",
+    "LegacyAlphaTrainer",
+    "StackVmFormulaExecutorAdapter",
+]
+```
+
+model_core/infrastructure/adapters/backtest_engine.py
+```python
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+
+from model_core.backtest import ChinaBacktest
+from model_core.domain.models import BacktestEvaluation
+
+
+class ChinaBacktestEngineAdapter:
+    """Adapter from `ChinaBacktest` to `BacktestEnginePort`."""
+
+    def __init__(self, backtest: Optional[ChinaBacktest] = None):
+        self._backtest = backtest or ChinaBacktest()
+
+    @property
+    def backtest(self) -> ChinaBacktest:
+        return self._backtest
+
+    def evaluate(
+        self,
+        factors: torch.Tensor,
+        raw_data: dict[str, torch.Tensor],
+        target_ret: torch.Tensor,
+        *,
+        return_details: bool = False,
+    ) -> BacktestEvaluation:
+        raw = self._backtest.evaluate(
+            factors,
+            raw_data,
+            target_ret,
+            return_details=return_details,
+        )
+        return BacktestEvaluation(
+            score=float(raw.score.item()),
+            mean_return=float(raw.mean_return),
+            metrics=dict(raw.metrics or {}),
+            equity_curve=raw.equity_curve.tolist() if raw.equity_curve is not None else None,
+            portfolio_returns=raw.portfolio_returns.tolist() if raw.portfolio_returns is not None else None,
+        )
+```
+
+model_core/infrastructure/adapters/data_gateway.py
+```python
+from __future__ import annotations
+
+from typing import Optional
+
+from model_core.data_loader import (
+    ChinaMinuteDataLoader,
+    DataSlice as LegacyDataSlice,
+    WalkForwardFold as LegacyWalkForwardFold,
+)
+from model_core.domain.models import DataBundle, DatasetSlice, WalkForwardBundle
+
+
+class ChinaDataGatewayAdapter:
+    """Adapter from `ChinaMinuteDataLoader` to `DataGatewayPort`."""
+
+    def __init__(self, loader: Optional[ChinaMinuteDataLoader] = None):
+        self._loader = loader or ChinaMinuteDataLoader()
+
+    @property
+    def loader(self) -> ChinaMinuteDataLoader:
+        return self._loader
+
+    def load(
+        self,
+        *,
+        codes: Optional[list[str]] = None,
+        years: Optional[list[int]] = None,
+        start_date: str = "",
+        end_date: str = "",
+        signal_time: str = "",
+        exit_time: str = "",
+        limit_codes: int = 50,
+    ) -> None:
+        self._loader.load_data(
+            codes=codes,
+            years=years,
+            start_date=start_date,
+            end_date=end_date,
+            signal_time=signal_time,
+            exit_time=exit_time,
+            limit_codes=limit_codes,
+        )
+
+    def bundle(self) -> DataBundle:
+        if (
+            self._loader.feat_tensor is None
+            or self._loader.raw_data_cache is None
+            or self._loader.target_ret is None
+            or self._loader.dates is None
+        ):
+            raise ValueError("Data not loaded. Call load() first.")
+        return DataBundle(
+            feat_tensor=self._loader.feat_tensor,
+            raw_data_cache=self._loader.raw_data_cache,
+            target_ret=self._loader.target_ret,
+            dates=self._loader.dates,
+            symbols=self._loader.symbols or [],
+        )
+
+    def train_val_test_split(self) -> dict[str, DatasetSlice]:
+        return {
+            name: self._convert_slice(data_slice)
+            for name, data_slice in self._loader.train_val_test_split().items()
+        }
+
+    def walk_forward_splits(self) -> list[WalkForwardBundle]:
+        return [self._convert_fold(fold) for fold in self._loader.walk_forward_splits()]
+
+    def _convert_slice(self, data_slice: LegacyDataSlice) -> DatasetSlice:
+        return DatasetSlice(
+            feat_tensor=data_slice.feat_tensor,
+            raw_data_cache=data_slice.raw_data_cache,
+            target_ret=data_slice.target_ret,
+            dates=data_slice.dates,
+            symbols=data_slice.symbols,
+            start_idx=data_slice.start_idx,
+            end_idx=data_slice.end_idx,
+        )
+
+    def _convert_fold(self, fold: LegacyWalkForwardFold) -> WalkForwardBundle:
+        return WalkForwardBundle(
+            train=self._convert_slice(fold.train),
+            val=self._convert_slice(fold.val),
+            test=self._convert_slice(fold.test),
+        )
+```
+
+model_core/infrastructure/adapters/formula_executor.py
+```python
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+
+from model_core.domain.models import Formula
+from model_core.vm import StackVM
+
+
+class StackVmFormulaExecutorAdapter:
+    """Adapter from `StackVM` to `FormulaExecutorPort`."""
+
+    def __init__(self, vm: Optional[StackVM] = None):
+        self._vm = vm or StackVM()
+
+    @property
+    def vm(self) -> StackVM:
+        return self._vm
+
+    def execute(self, formula: Formula, feat_tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        return self._vm.execute(formula, feat_tensor)
+```
+
+model_core/infrastructure/adapters/trainer.py
+```python
+from __future__ import annotations
+
+from typing import Callable, Optional
+
+from tqdm import tqdm
+
+from model_core.application.services import TrainingWorkflowService
+from model_core.config import ModelConfig
+from model_core.domain.models import TrainingArtifact
+
+
+class LegacyAlphaTrainer:
+    """Compatibility trainer adapter backed by the workflow service."""
+
+    def __init__(
+        self,
+        *,
+        use_lord_regularization: bool = True,
+        lord_decay_rate: float = 1e-3,
+        lord_num_iterations: int = 5,
+        workflow_factory: Optional[Callable[..., TrainingWorkflowService]] = None,
+    ):
+        if workflow_factory is None:
+            raise ValueError("workflow_factory is required for LegacyAlphaTrainer.")
+        self._workflow_factory = workflow_factory
+        self._workflow_kwargs = {
+            "use_lord_regularization": use_lord_regularization,
+            "lord_decay_rate": lord_decay_rate,
+            "lord_num_iterations": lord_num_iterations,
+        }
+        self._workflow: Optional[TrainingWorkflowService] = None
+
+    @property
+    def workflow(self) -> Optional[TrainingWorkflowService]:
+        return self._workflow
+
+    def train(self) -> TrainingArtifact:
+        self._workflow = self._workflow_factory(**self._workflow_kwargs)
+
+        print(
+            "🚀 Starting Alpha Mining with PPO + LoRD..."
+            if self._workflow.use_lord
+            else "🚀 Starting Alpha Mining with PPO..."
+        )
+        if self._workflow.use_lord:
+            print("   LoRD Regularization enabled")
+            print("   Target keywords: ['q_proj', 'k_proj', 'attention', 'qk_norm']")
+        for line in self._workflow.train_window_descriptions():
+            print(line)
+
+        def _on_new_best(score: float, mean_return: float, formula: list[int]) -> None:
+            tqdm.write(f"[!] New King: Score {score:.2f} | Ret {mean_return:.2%} | Formula {formula}")
+
+        result = self._workflow.run(
+            strategy_path=ModelConfig.STRATEGY_FILE,
+            history_path="training_history.json",
+            on_new_best=_on_new_best,
+        )
+
+        print("\n✓ Training completed!")
+        print(f"  Best score: {result.best_score:.4f}")
+        print(f"  Best formula: {result.best_formula}")
+        for snapshot in result.evaluations:
+            print(
+                f"  {snapshot.label}: Score {snapshot.score:.4f} | "
+                f"MeanRet {snapshot.mean_return:.2%} | Sharpe {snapshot.sharpe:.2f} | "
+                f"MaxDD {snapshot.max_drawdown:.2%}"
+            )
+
+        return TrainingArtifact(
+            best_formula=result.best_formula,
+            best_score=float(result.best_score),
+            strategy_path=ModelConfig.STRATEGY_FILE,
+        )
 ```
 
 model_core/ops.py
@@ -2135,6 +3574,97 @@ OPS_CONFIG: list[tuple[str, Callable[..., torch.Tensor], int]] = [
     ('STD20', lambda x: _ts_zscore(x, 20), 1),
     ('TS_RANK20', lambda x: _ts_zscore(x, 20), 1),
 ]
+```
+
+model_core/ports/__init__.py
+```python
+"""Port interfaces for dependency inversion."""
+
+from .interfaces import (
+    BacktestEnginePort,
+    DataGatewayPort,
+    FormulaExecutorPort,
+    TrainerPort,
+)
+
+__all__ = [
+    "BacktestEnginePort",
+    "DataGatewayPort",
+    "FormulaExecutorPort",
+    "TrainerPort",
+]
+```
+
+model_core/ports/interfaces.py
+```python
+from __future__ import annotations
+
+from typing import Optional, Protocol
+
+import torch
+
+from model_core.domain.models import (
+    BacktestEvaluation,
+    DataBundle,
+    DatasetSlice,
+    Formula,
+    TrainingArtifact,
+    WalkForwardBundle,
+)
+
+
+class DataGatewayPort(Protocol):
+    """Data access contract for loading and slicing market data."""
+
+    def load(
+        self,
+        *,
+        codes: Optional[list[str]] = None,
+        years: Optional[list[int]] = None,
+        start_date: str = "",
+        end_date: str = "",
+        signal_time: str = "",
+        exit_time: str = "",
+        limit_codes: int = 50,
+    ) -> None:
+        ...
+
+    def bundle(self) -> DataBundle:
+        ...
+
+    def train_val_test_split(self) -> dict[str, DatasetSlice]:
+        ...
+
+    def walk_forward_splits(self) -> list[WalkForwardBundle]:
+        ...
+
+
+class FormulaExecutorPort(Protocol):
+    """Formula execution contract."""
+
+    def execute(self, formula: Formula, feat_tensor: torch.Tensor) -> Optional[torch.Tensor]:
+        ...
+
+
+class BacktestEnginePort(Protocol):
+    """Backtest evaluation contract."""
+
+    def evaluate(
+        self,
+        factors: torch.Tensor,
+        raw_data: dict[str, torch.Tensor],
+        target_ret: torch.Tensor,
+        *,
+        return_details: bool = False,
+    ) -> BacktestEvaluation:
+        ...
+
+
+class TrainerPort(Protocol):
+    """Training orchestration contract."""
+
+    def train(self) -> TrainingArtifact:
+        ...
 ```
 
 model_core/vm.py
@@ -2245,12 +3775,9 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import torch
 
 from model_core.config import ModelConfig
-from model_core.data_loader import ChinaMinuteDataLoader
-from model_core.backtest import ChinaBacktest
-from model_core.vm import StackVM
+from model_core.entrypoints import create_backtest_use_case
 
 
 def load_strategy(filepath: str) -> list:
@@ -2266,7 +3793,7 @@ def print_metrics(title: str, result) -> None:
     print("\n" + "-" * 60)
     print(title)
     print("-" * 60)
-    print(f"Sortino Score: {result.score.item():.4f}")
+    print(f"Sortino Score: {result.score:.4f}")
     print(f"Mean Return: {result.mean_return:.4%}")
     if not result.metrics:
         return
@@ -2285,8 +3812,8 @@ def save_equity_curve(path: str, dates, result) -> None:
     df = pd.DataFrame(
         {
             "date": dates.astype("datetime64[ns]"),
-            "equity": result.equity_curve.numpy(),
-            "return": result.portfolio_returns.numpy(),
+            "equity": result.equity_curve,
+            "return": result.portfolio_returns,
         }
     )
     df.to_csv(out_path, index=False)
@@ -2301,96 +3828,80 @@ def run_backtest(
     curve_out: str | None = None,
 ):
     print("Loading minute CSV data...")
-    loader = ChinaMinuteDataLoader()
-    loader.load_data(
-        codes=symbols or ModelConfig.CN_CODES,
-        years=ModelConfig.CN_MINUTE_YEARS,
-        start_date=ModelConfig.CN_MINUTE_START_DATE,
-        end_date=ModelConfig.CN_MINUTE_END_DATE,
-        signal_time=ModelConfig.CN_SIGNAL_TIME,
-        exit_time=ModelConfig.CN_EXIT_TIME,
+    mode = "walk_forward" if walk_forward else ("split" if split else "full")
+    backtest_use_case, _ = create_backtest_use_case()
+    use_case_result = backtest_use_case.run(
+        formula=formula,
+        mode=mode,
+        symbols=symbols,
         limit_codes=ModelConfig.CN_MAX_CODES,
+        return_details=True,
     )
-
-    print(f"Data shape: {loader.feat_tensor.shape}")
-    print(f"Symbols: {len(loader.symbols) if loader.symbols else 'N/A'}")
-    print(f"Date range: {loader.dates.min()} to {loader.dates.max()}")
-
-    print("\nExecuting strategy formula...")
-    vm = StackVM()
-    factors = vm.execute(formula, loader.feat_tensor)
-
-    if factors is None:
-        print("❌ Invalid formula - execution failed")
-        return
-
-    if factors.std() < 1e-4:
-        print("⚠️  Warning: Factor has near-zero variance (trivial formula)")
-
-    print("\nRunning backtest...")
-    bt = ChinaBacktest()
-
-    if walk_forward:
-        folds = loader.walk_forward_splits()
-        if not folds:
-            print("⚠️  Walk-forward disabled: not enough data for configured windows.")
-        else:
-            val_scores = []
-            test_scores = []
-            for idx, fold in enumerate(folds, 1):
-                if fold.val.end_idx > fold.val.start_idx:
-                    res_val = factors[:, fold.val.start_idx:fold.val.end_idx]
-                    val_result = bt.evaluate(
-                        res_val,
-                        fold.val.raw_data_cache,
-                        fold.val.target_ret,
-                        return_details=True,
-                    )
-                    print_metrics(f"Fold {idx} - Validation", val_result)
-                    val_scores.append(val_result.score.item())
-                if fold.test.end_idx > fold.test.start_idx:
-                    res_test = factors[:, fold.test.start_idx:fold.test.end_idx]
-                    test_result = bt.evaluate(
-                        res_test,
-                        fold.test.raw_data_cache,
-                        fold.test.target_ret,
-                        return_details=True,
-                    )
-                    print_metrics(f"Fold {idx} - Test", test_result)
-                    test_scores.append(test_result.score.item())
-            if val_scores:
-                print(f"\nWalk-forward Avg Val Score: {sum(val_scores) / len(val_scores):.4f}")
-            if test_scores:
-                print(f"Walk-forward Avg Test Score: {sum(test_scores) / len(test_scores):.4f}")
+    if not use_case_result.ok:
+        print(f"❌ {use_case_result.message}")
         return None
 
-    if split:
-        splits = loader.train_val_test_split()
+    payload = use_case_result.payload or {}
+    dates = payload.get("dates")
+    symbols_loaded = payload.get("symbols") or []
+    feat_shape = payload.get("feat_shape")
+    warnings = payload.get("warnings") or []
+
+    if dates is None:
+        print("❌ Backtest use-case returned incomplete payload")
+        return None
+
+    print(f"Data shape: {feat_shape}")
+    print(f"Symbols: {len(symbols_loaded) if symbols_loaded else 'N/A'}")
+    print(f"Date range: {dates.min()} to {dates.max()}")
+    print("\nExecuting strategy formula...")
+    for warning in warnings:
+        print(f"⚠️  Warning: {warning}")
+    print("\nRunning backtest...")
+
+    if mode == "walk_forward":
+        folds = payload.get("folds") or []
+        if not folds:
+            print(f"⚠️  {use_case_result.message}")
+            return None
+        for fold in folds:
+            idx = fold.get("index")
+            val_result = fold.get("val")
+            test_result = fold.get("test")
+            if val_result is not None:
+                print_metrics(f"Fold {idx} - Validation", val_result)
+            if test_result is not None:
+                print_metrics(f"Fold {idx} - Test", test_result)
+        avg_val_score = payload.get("avg_val_score")
+        avg_test_score = payload.get("avg_test_score")
+        if avg_val_score is not None:
+            print(f"\nWalk-forward Avg Val Score: {avg_val_score:.4f}")
+        if avg_test_score is not None:
+            print(f"Walk-forward Avg Test Score: {avg_test_score:.4f}")
+        return None
+
+    if mode == "split":
+        split_results = payload.get("splits") or {}
         for name in ("train", "val", "test"):
-            if name not in splits:
+            out = split_results.get(name)
+            if not out:
                 continue
-            split_slice = splits[name]
-            res_slice = factors[:, split_slice.start_idx:split_slice.end_idx]
-            result = bt.evaluate(
-                res_slice,
-                split_slice.raw_data_cache,
-                split_slice.target_ret,
-                return_details=True,
-            )
+            result = out.get("result")
+            split_dates = out.get("dates")
+            if result is None or split_dates is None:
+                continue
             print_metrics(f"{name.capitalize()} Results", result)
             if curve_out:
                 suffix = f"_{name}"
                 out_path = Path(curve_out)
                 out_file = out_path.with_name(f"{out_path.stem}{suffix}{out_path.suffix or '.csv'}")
-                save_equity_curve(str(out_file), split_slice.dates, result)
+                save_equity_curve(str(out_file), split_dates, result)
         return None
 
-    result = bt.evaluate(
-        factors,
-        loader.raw_data_cache,
-        loader.target_ret,
-        return_details=True,
-    )
+    result = payload.get("result")
+    if result is None:
+        print("❌ Backtest use-case returned no full-sample result")
+        return None
 
     print("\n" + "=" * 60)
     print("📊 Backtest Results")
@@ -2398,10 +3909,10 @@ def run_backtest(
     print_metrics("Full Sample", result)
 
     if curve_out:
-        save_equity_curve(curve_out, loader.dates, result)
+        save_equity_curve(curve_out, dates, result)
 
     return {
-        'score': result.score.item(),
+        'score': result.score,
         'mean_return': result.mean_return,
         'avg_turnover': result.metrics["avg_turnover"] if result.metrics else 0.0,
     }
@@ -2476,7 +3987,7 @@ Requirements:
 import os
 import sys
 
-from model_core.engine import AlphaEngine
+from model_core.entrypoints import create_train_use_case
 
 
 def main():
@@ -2487,16 +3998,16 @@ def main():
     print()
 
     try:
-        engine = AlphaEngine(use_lord_regularization=True)
-        engine.train()
+        train_use_case, _ = create_train_use_case(use_lord_regularization=True)
+        artifact = train_use_case.run()
 
         print("\n" + "=" * 60)
         print("✅ Training Complete!")
         print("=" * 60)
 
-        if engine.best_formula:
-            print(f"Best Score: {engine.best_score:.4f}")
-            print(f"Best Formula: {engine.best_formula}")
+        if artifact.best_formula:
+            print(f"Best Score: {artifact.best_score:.4f}")
+            print(f"Best Formula: {artifact.best_formula}")
         else:
             print("⚠️  No valid formula found. Try increasing TRAIN_STEPS.")
 
@@ -2520,10 +4031,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from model_core.code_alias import load_code_alias_map
 
