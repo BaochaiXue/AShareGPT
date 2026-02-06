@@ -6,9 +6,9 @@ from model_core.application.use_cases import BacktestFormulaUseCase, TrainAlphaU
 from model_core.infrastructure import (
     ChinaBacktestEngineAdapter,
     ChinaDataGatewayAdapter,
+    LegacyAlphaTrainer,
     StackVmFormulaExecutorAdapter,
 )
-from model_core.infrastructure.legacy import LegacyAlphaTrainer
 from .factories import create_training_workflow_service
 
 

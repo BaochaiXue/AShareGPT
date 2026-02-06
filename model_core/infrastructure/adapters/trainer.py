@@ -10,7 +10,7 @@ from model_core.domain.models import TrainingArtifact
 
 
 class LegacyAlphaTrainer:
-    """Adapter exposing the application workflow as a legacy trainer port."""
+    """Compatibility trainer adapter backed by the workflow service."""
 
     def __init__(
         self,

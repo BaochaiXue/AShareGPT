@@ -1,5 +1,5 @@
 """Legacy adapters kept for migration compatibility."""
 
-from .trainer import LegacyAlphaTrainer
+from model_core.infrastructure.adapters.trainer import LegacyAlphaTrainer
 
 __all__ = ["LegacyAlphaTrainer"]
