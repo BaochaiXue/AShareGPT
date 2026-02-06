@@ -8,7 +8,9 @@ import torch
 
 from .config import ModelConfig
 from .code_alias import load_code_alias_map
+from .data.io import read_csv_any_encoding
 from .factors import FeatureEngineer
+from .market.cn_rules import ChinaMarketRules
 
 
 @dataclass
@@ -33,6 +35,7 @@ class ChinaMinuteDataLoader:
     """
     Minute-level data loader for China A-share/ETF.
     Builds decision tensors from minute bars with configurable:
+    - decision frequency (`daily` vs `1min`)
     - bar semantics (`daily` vs `signal_snapshot`)
     - return semantics (`close_to_close` vs `signal_to_exit`)
     """
@@ -64,6 +67,16 @@ class ChinaMinuteDataLoader:
                 return None
 
     @staticmethod
+    def _resolve_decision_freq() -> str:
+        freq = ModelConfig.CN_DECISION_FREQ.strip().lower()
+        if freq not in {"daily", "1min"}:
+            raise ValueError(
+                f"Unsupported CN_DECISION_FREQ={ModelConfig.CN_DECISION_FREQ!r}; "
+                "expected 'daily' or '1min'."
+            )
+        return freq
+
+    @staticmethod
     def _resolve_bar_style() -> str:
         style = ModelConfig.CN_BAR_STYLE.strip().lower()
         if style not in {"daily", "signal_snapshot"}:
@@ -74,13 +87,23 @@ class ChinaMinuteDataLoader:
         return style
 
     @staticmethod
-    def _resolve_target_ret_mode() -> tuple[str, int]:
+    def _resolve_target_ret_mode(decision_freq: str = "daily") -> tuple[str, int]:
         mode = ModelConfig.CN_TARGET_RET_MODE.strip().lower()
         if mode not in {"close_to_close", "signal_to_exit"}:
             raise ValueError(
                 f"Unsupported CN_TARGET_RET_MODE={ModelConfig.CN_TARGET_RET_MODE!r}; "
                 "expected 'close_to_close' or 'signal_to_exit'."
             )
+        if decision_freq == "1min":
+            if mode != "close_to_close":
+                raise ValueError(
+                    "CN_DECISION_FREQ='1min' currently supports only CN_TARGET_RET_MODE='close_to_close'."
+                )
+            hold_bars = int(ModelConfig.CN_HOLD_BARS)
+            if hold_bars < 1:
+                raise ValueError("CN_HOLD_BARS must be >= 1 when CN_DECISION_FREQ='1min'.")
+            return mode, hold_bars
+
         if mode == "signal_to_exit":
             return mode, 0
 
@@ -130,21 +153,11 @@ class ChinaMinuteDataLoader:
         return candidates[:limit_codes] if limit_codes else candidates
 
     def _read_adj_factor_csv(self, path: Path) -> pd.DataFrame:
-        encodings = ("utf-8", "utf-8-sig", "gbk", "gb18030")
-        last_err: Optional[Exception] = None
-        for enc in encodings:
-            try:
-                return pd.read_csv(
-                    path,
-                    usecols=lambda c: c in {"date", "adj_factor", "code", "证券代码"},
-                    dtype={"date": "string"},
-                    encoding=enc,
-                )
-            except Exception as exc:
-                last_err = exc
-        if last_err:
-            raise last_err
-        return pd.DataFrame()
+        return read_csv_any_encoding(
+            path,
+            usecols=lambda c: c in {"date", "adj_factor", "code", "证券代码"},
+            dtype={"date": "string"},
+        )
 
     def _load_adj_factors(self, code: str) -> Optional[pd.DataFrame]:
         if not ModelConfig.CN_USE_ADJ_FACTOR:
@@ -387,73 +400,140 @@ class ChinaMinuteDataLoader:
         bar_style: str,
         target_ret_mode: str,
     ) -> list[dict[str, float | pd.Timestamp]]:
+        minute_df = self._load_minute_frame_for_code(
+            code=code,
+            years=years,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            end_dt_exclusive=end_dt_exclusive,
+        )
+        if minute_df.empty:
+            return []
+
         records: list[dict[str, float | pd.Timestamp]] = []
+        for date, day_frame in minute_df.groupby("date"):
+            day_frame = day_frame.sort_values("trade_time")
+            time_series = day_frame["trade_time"].dt.time
+            entry_candidates = day_frame[time_series >= sig_time]
+            entry_row = entry_candidates.iloc[0] if not entry_candidates.empty else day_frame.iloc[0]
+
+            if exit_t:
+                exit_candidates = day_frame[time_series >= exit_t]
+                exit_row = exit_candidates.iloc[0] if not exit_candidates.empty else day_frame.iloc[-1]
+            else:
+                exit_row = day_frame.iloc[-1]
+
+            if bar_style == "daily":
+                rec = {
+                    "date": date,
+                    "open": float(day_frame.iloc[0]["open"]),
+                    "high": float(day_frame["high"].max()),
+                    "low": float(day_frame["low"].min()),
+                    "close": float(day_frame.iloc[-1]["close"]),
+                    "volume": float(day_frame["vol"].sum()),
+                    "amount": float(day_frame["amount"].sum()),
+                }
+            else:
+                rec = {
+                    "date": date,
+                    "open": float(entry_row["open"]),
+                    "high": float(entry_row["high"]),
+                    "low": float(entry_row["low"]),
+                    "close": float(entry_row["close"]),
+                    "volume": float(entry_row["vol"]),
+                    "amount": float(entry_row["amount"]),
+                }
+
+            if target_ret_mode == "signal_to_exit":
+                entry_open = float(entry_row["open"])
+                exit_close = float(exit_row["close"])
+                if entry_open == 0:
+                    continue
+                rec["target_ret"] = (exit_close / entry_open) - 1.0
+
+            records.append(rec)
+        return records
+
+    def _load_minute_frame_for_code(
+        self,
+        *,
+        code: str,
+        years: list[int],
+        start_dt: Optional[pd.Timestamp],
+        end_dt: Optional[pd.Timestamp],
+        end_dt_exclusive: Optional[pd.Timestamp],
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
         for year in years:
             path = self.data_root / str(year) / f"{code}.csv"
             if not path.exists():
                 continue
-            df = pd.read_csv(
+            df = read_csv_any_encoding(
                 path,
                 usecols=["trade_time", "open", "high", "low", "close", "vol", "amount"],
                 dtype={"trade_time": "string"},
             )
             if df.empty:
                 continue
-            df["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
-            df = df.dropna(subset=["trade_time"])
-            if start_dt is not None:
-                df = df[df["trade_time"] >= start_dt]
-            if end_dt_exclusive is not None:
-                # Date-only end bounds are inclusive of the whole end day.
-                df = df[df["trade_time"] < end_dt_exclusive]
-            elif end_dt is not None:
-                df = df[df["trade_time"] <= end_dt]
-            if df.empty:
-                continue
-            df["date"] = df["trade_time"].dt.normalize()
+            frames.append(df)
 
-            for date, day_frame in df.groupby("date"):
-                day_frame = day_frame.sort_values("trade_time")
-                time_series = day_frame["trade_time"].dt.time
-                entry_candidates = day_frame[time_series >= sig_time]
-                entry_row = entry_candidates.iloc[0] if not entry_candidates.empty else day_frame.iloc[0]
+        if not frames:
+            return pd.DataFrame()
 
-                if exit_t:
-                    exit_candidates = day_frame[time_series >= exit_t]
-                    exit_row = exit_candidates.iloc[0] if not exit_candidates.empty else day_frame.iloc[-1]
-                else:
-                    exit_row = day_frame.iloc[-1]
+        minute_df = pd.concat(frames, ignore_index=True)
+        minute_df["trade_time"] = pd.to_datetime(minute_df["trade_time"], errors="coerce")
+        minute_df = minute_df.dropna(subset=["trade_time"])
+        if minute_df.empty:
+            return minute_df
 
-                if bar_style == "daily":
-                    rec = {
-                        "date": date,
-                        "open": float(day_frame.iloc[0]["open"]),
-                        "high": float(day_frame["high"].max()),
-                        "low": float(day_frame["low"].min()),
-                        "close": float(day_frame.iloc[-1]["close"]),
-                        "volume": float(day_frame["vol"].sum()),
-                        "amount": float(day_frame["amount"].sum()),
-                    }
-                else:
-                    rec = {
-                        "date": date,
-                        "open": float(entry_row["open"]),
-                        "high": float(entry_row["high"]),
-                        "low": float(entry_row["low"]),
-                        "close": float(entry_row["close"]),
-                        "volume": float(entry_row["vol"]),
-                        "amount": float(entry_row["amount"]),
-                    }
+        if start_dt is not None:
+            minute_df = minute_df[minute_df["trade_time"] >= start_dt]
+        if end_dt_exclusive is not None:
+            minute_df = minute_df[minute_df["trade_time"] < end_dt_exclusive]
+        elif end_dt is not None:
+            minute_df = minute_df[minute_df["trade_time"] <= end_dt]
+        if minute_df.empty:
+            return minute_df
 
-                if target_ret_mode == "signal_to_exit":
-                    entry_open = float(entry_row["open"])
-                    exit_close = float(exit_row["close"])
-                    if entry_open == 0:
-                        continue
-                    rec["target_ret"] = (exit_close / entry_open) - 1.0
+        for col in ("open", "high", "low", "close", "vol", "amount"):
+            minute_df[col] = pd.to_numeric(minute_df[col], errors="coerce")
+        minute_df = minute_df.dropna(subset=["open", "high", "low", "close", "vol", "amount"])
+        minute_df = minute_df.sort_values("trade_time").drop_duplicates(subset=["trade_time"], keep="last")
+        minute_df["date"] = minute_df["trade_time"].dt.normalize()
+        return minute_df
 
-                records.append(rec)
-        return records
+    def _load_minute_records_for_code(
+        self,
+        *,
+        code: str,
+        years: list[int],
+        start_dt: Optional[pd.Timestamp],
+        end_dt: Optional[pd.Timestamp],
+        end_dt_exclusive: Optional[pd.Timestamp],
+    ) -> list[dict[str, float | pd.Timestamp]]:
+        minute_df = self._load_minute_frame_for_code(
+            code=code,
+            years=years,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            end_dt_exclusive=end_dt_exclusive,
+        )
+        if minute_df.empty:
+            return []
+
+        return [
+            {
+                "trade_time": row.trade_time,
+                "date": row.date,
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+                "volume": float(row.vol),
+                "amount": float(row.amount),
+            }
+            for row in minute_df.itertuples(index=False)
+        ]
 
     def _build_per_code_frames(
         self,
@@ -468,24 +548,37 @@ class ChinaMinuteDataLoader:
         bar_style: str,
         target_ret_mode: str,
         hold_days: int,
+        decision_freq: str = "daily",
     ) -> dict[str, pd.DataFrame]:
         per_code_frames: dict[str, pd.DataFrame] = {}
         for code in codes:
-            records = self._load_daily_records_for_code(
-                code=code,
-                years=years,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                end_dt_exclusive=end_dt_exclusive,
-                sig_time=sig_time,
-                exit_t=exit_t,
-                bar_style=bar_style,
-                target_ret_mode=target_ret_mode,
-            )
+            if decision_freq == "1min":
+                records = self._load_minute_records_for_code(
+                    code=code,
+                    years=years,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    end_dt_exclusive=end_dt_exclusive,
+                )
+            else:
+                records = self._load_daily_records_for_code(
+                    code=code,
+                    years=years,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    end_dt_exclusive=end_dt_exclusive,
+                    sig_time=sig_time,
+                    exit_t=exit_t,
+                    bar_style=bar_style,
+                    target_ret_mode=target_ret_mode,
+                )
             if not records:
                 continue
             frame = pd.DataFrame(records)
-            frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+            if decision_freq == "1min":
+                frame = frame.drop_duplicates(subset=["trade_time"], keep="last").sort_values("trade_time")
+            else:
+                frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
             if target_ret_mode == "close_to_close":
@@ -498,17 +591,28 @@ class ChinaMinuteDataLoader:
         per_code_frames: dict[str, pd.DataFrame],
         *,
         end_dt: Optional[pd.Timestamp],
+        decision_freq: str = "daily",
     ) -> None:
         if end_dt is not None or not ModelConfig.CN_MINUTE_DAYS:
             return
         cutoff_days = ModelConfig.CN_MINUTE_DAYS
         for code, frame in list(per_code_frames.items()):
-            frame = frame.sort_values("date")
-            if len(frame) > cutoff_days:
+            frame = frame.sort_values("trade_time" if decision_freq == "1min" else "date")
+            if decision_freq == "1min":
+                unique_days = frame["date"].drop_duplicates().sort_values()
+                if len(unique_days) > cutoff_days:
+                    keep_days = set(unique_days.iloc[-cutoff_days:].tolist())
+                    frame = frame[frame["date"].isin(keep_days)]
+            elif len(frame) > cutoff_days:
                 frame = frame.iloc[-cutoff_days:]
             per_code_frames[code] = frame
 
-    def _build_pivots(self, per_code_frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    def _build_pivots(
+        self,
+        per_code_frames: dict[str, pd.DataFrame],
+        *,
+        index_col: str = "date",
+    ) -> dict[str, pd.DataFrame]:
         def build_pivot(
             field: str,
             *,
@@ -517,7 +621,10 @@ class ChinaMinuteDataLoader:
         ) -> pd.DataFrame:
             series_list = []
             for code, frame in per_code_frames.items():
-                s = frame.set_index("date")[field].rename(code)
+                if field == "tradable":
+                    s = pd.Series(1.0, index=frame[index_col], name=code)
+                else:
+                    s = frame.set_index(index_col)[field].rename(code)
                 series_list.append(s)
             pivot = pd.concat(series_list, axis=1).sort_index()
             if ffill:
@@ -534,6 +641,7 @@ class ChinaMinuteDataLoader:
             "volume": (False, 0.0),
             "amount": (False, 0.0),
             "target_ret": (False, None),
+            "tradable": (False, 0.0),
         }
         pivots = {
             field: build_pivot(field, ffill=ffill, fill_value=fill_value)
@@ -570,6 +678,7 @@ class ChinaMinuteDataLoader:
             "close": self._pivot_to_tensor(pivots["close"], index=index, columns=columns),
             "volume": self._pivot_to_tensor(pivots["volume"], index=index, columns=columns),
             "amount": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
+            "tradable": self._pivot_to_tensor(pivots["tradable"], index=index, columns=columns),
             "liquidity": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
             "fdv": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
         }
@@ -580,6 +689,34 @@ class ChinaMinuteDataLoader:
                 columns=columns,
             )
         return raw_data_cache, target_tensor
+
+    def _attach_execution_rule_tensors(
+        self,
+        *,
+        raw_data_cache: dict[str, torch.Tensor],
+        index: pd.DatetimeIndex,
+        symbols: list[str],
+        decision_freq: str,
+    ) -> None:
+        rules = ChinaMarketRules.from_config()
+        session_ids = rules.build_session_id_matrix(
+            dates=index,
+            num_assets=len(symbols),
+            device=ModelConfig.DEVICE,
+        )
+        t_plus_one_required = rules.t_plus_one_required_matrix(
+            symbols=symbols,
+            num_steps=len(index),
+            device=ModelConfig.DEVICE,
+        )
+        t_plus_one_sell_block = rules.build_t_plus_one_sell_block(
+            session_ids=session_ids,
+            t_plus_one_required=t_plus_one_required,
+            decision_freq=decision_freq,
+        )
+        raw_data_cache["session_id"] = session_ids
+        raw_data_cache["t_plus_one_required"] = t_plus_one_required
+        raw_data_cache["t_plus_one_sell_block"] = t_plus_one_sell_block
 
     def load_data(
         self,
@@ -601,8 +738,9 @@ class ChinaMinuteDataLoader:
 
         sig_time = self._parse_time(signal_time or ModelConfig.CN_SIGNAL_TIME) or time(10, 0)
         exit_t = self._parse_time(exit_time or ModelConfig.CN_EXIT_TIME)
+        decision_freq = self._resolve_decision_freq()
         bar_style = self._resolve_bar_style()
-        target_ret_mode, hold_days = self._resolve_target_ret_mode()
+        target_ret_mode, hold_period = self._resolve_target_ret_mode(decision_freq)
         start_dt, end_dt, end_dt_exclusive = self._resolve_time_bounds(start_date, end_date)
         per_code_frames = self._build_per_code_frames(
             codes=codes,
@@ -614,14 +752,16 @@ class ChinaMinuteDataLoader:
             exit_t=exit_t,
             bar_style=bar_style,
             target_ret_mode=target_ret_mode,
-            hold_days=hold_days,
+            hold_days=hold_period,
+            decision_freq=decision_freq,
         )
 
         if not per_code_frames:
             raise ValueError("No minute data loaded. Check codes/years/date filters.")
 
-        self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt)
-        pivots = self._build_pivots(per_code_frames)
+        self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt, decision_freq=decision_freq)
+        index_col = "trade_time" if decision_freq == "1min" else "date"
+        pivots = self._build_pivots(per_code_frames, index_col=index_col)
 
         index = pivots["close"].index
         columns = pivots["close"].columns
@@ -631,6 +771,12 @@ class ChinaMinuteDataLoader:
             pivots,
             index=index,
             columns=columns,
+        )
+        self._attach_execution_rule_tensors(
+            raw_data_cache=self.raw_data_cache,
+            index=index,
+            symbols=list(columns),
+            decision_freq=decision_freq,
         )
 
         raw_feat = FeatureEngineer.compute_features(
@@ -646,13 +792,16 @@ class ChinaMinuteDataLoader:
 
         print(f"CN Minute Data Ready. Shape: {self.feat_tensor.shape}")
         if target_ret_mode == "close_to_close":
-            print(f"[ret] mode=close_to_close hold_days={hold_days}")
+            hold_label = "hold_bars" if decision_freq == "1min" else "hold_days"
+            print(f"[ret] mode=close_to_close {hold_label}={hold_period}")
         else:
             print(
                 f"[ret] mode=signal_to_exit signal_time={sig_time.strftime('%H:%M:%S')} "
                 f"exit_time={(exit_t.strftime('%H:%M:%S') if exit_t else 'eod')}"
             )
-        print(f"[bar] style={bar_style}")
+        print(f"[decision] freq={decision_freq}")
+        if decision_freq != "1min":
+            print(f"[bar] style={bar_style}")
         if self.feature_norm_info:
             print(
                 "[norm] mode={mode} fit_len={fit_len} clip={clip}".format(

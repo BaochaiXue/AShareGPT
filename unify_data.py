@@ -2,66 +2,23 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import os
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 import pandas as pd
 
-
-def read_last_line(path: Path) -> str:
-    if not path.exists():
-        return ""
-    with path.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        if size == 0:
-            return ""
-        block = 4096
-        offset = min(size, block)
-        while True:
-            f.seek(size - offset)
-            chunk = f.read(offset)
-            if b"\n" in chunk or size == offset:
-                lines = chunk.splitlines()
-                return lines[-1].decode("utf-8", errors="ignore") if lines else ""
-            offset = min(size, offset * 2)
+from model_core.data.io import (
+    read_csv_any_encoding,
+    read_last_row_token,
+    safe_to_datetime,
+)
 
 
-def get_last_token(path: Path, expect_time: bool, time_col: str) -> Optional[str]:
-    if not path.exists():
-        return None
-    line = read_last_line(path)
-    if not line:
-        return None
-    col_idx = 0
-    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
-        header = next(csv.reader(handle), None)
-        if header and time_col in header:
-            col_idx = header.index(time_col)
-    row = next(csv.reader([line]), [])
-    if col_idx >= len(row):
-        return None
-    token = row[col_idx].strip()
-    if expect_time:
-        if len(token) >= 10 and token[:4].isdigit():
-            return token
-        return None
-    if token.isdigit() and len(token) >= 8:
-        return token
-    return None
-
-
-def read_csv_fallback(path: Path, *, dtype: dict, usecols) -> pd.DataFrame:
-    encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030"]
-    last_err: Optional[Exception] = None
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, dtype=dtype, usecols=usecols, encoding=enc)
-        except Exception as exc:
-            last_err = exc
-    raise last_err if last_err else RuntimeError(f"read_csv failed for {path}")
+def _build_time_key(values: pd.Series, *, expect_time: bool) -> pd.Series:
+    key = safe_to_datetime(values)
+    if not expect_time:
+        key = key.dt.normalize()
+    return key
 
 
 def append_group(
@@ -77,15 +34,21 @@ def append_group(
     group = group.loc[:, cols].copy()
     group = group.dropna(subset=[time_col])
     group = group.drop_duplicates(subset=[time_col], keep="last")
+    group["_time_key"] = _build_time_key(group[time_col], expect_time=expect_time)
+    group = group.dropna(subset=["_time_key"])
 
-    last_token = get_last_token(output_path, expect_time=expect_time, time_col=time_col)
+    last_token = read_last_row_token(output_path, time_col)
     if last_token:
-        group = group[group[time_col] > last_token]
+        last_key = safe_to_datetime(pd.Series([last_token])).iloc[0]
+        if pd.notna(last_key):
+            if not expect_time:
+                last_key = last_key.normalize()
+            group = group[group["_time_key"] > last_key]
 
     if group.empty:
         return 0
 
-    group = group.sort_values(time_col)
+    group = group.sort_values("_time_key").drop(columns=["_time_key"])
     header = not output_path.exists()
 
     if not dry_run:
@@ -113,7 +76,7 @@ def process_minute_data(minute_root: Path, data_root: Path, dry_run: bool, max_f
         rel = path.relative_to(minute_root)
         year = rel.parts[0] if rel.parts else path.stem.split("-")[0]
 
-        df = read_csv_fallback(
+        df = read_csv_any_encoding(
             path,
             dtype={"证券代码": "string", "code": "string", "trade_time": "string"},
             usecols=lambda c: c in {"证券代码", "code", "trade_time", "open", "high", "low", "close", "vol", "amount"},
@@ -152,7 +115,7 @@ def process_adj_factors(adj_root: Path, data_root: Path, dry_run: bool, max_file
     for path in files:
         total_files += 1
 
-        df = read_csv_fallback(
+        df = read_csv_any_encoding(
             path,
             dtype={"证券代码": "string", "code": "string", "date": "string"},
             usecols=lambda c: c in {"证券代码", "code", "date", "adj_factor"},

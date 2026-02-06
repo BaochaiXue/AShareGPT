@@ -5,7 +5,6 @@ import argparse
 import csv
 import sys
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -14,26 +13,15 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from model_core.code_alias import load_code_alias_map  # noqa: E402
-
-
-ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+from model_core.data.io import read_csv_any_encoding, safe_to_numeric  # noqa: E402
 
 
 def read_adj_csv(path: Path) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
-    for enc in ENCODINGS:
-        try:
-            return pd.read_csv(
-                path,
-                usecols=lambda c: c in {"code", "date", "adj_factor", "证券代码"},
-                dtype={"date": "string"},
-                encoding=enc,
-            )
-        except Exception as exc:
-            last_err = exc
-    if last_err is not None:
-        raise last_err
-    return pd.DataFrame()
+    return read_csv_any_encoding(
+        path,
+        usecols=lambda c: c in {"code", "date", "adj_factor", "证券代码"},
+        dtype={"date": "string"},
+    )
 
 
 def collect_minute_codes(data_root: Path) -> set[str]:
@@ -56,8 +44,8 @@ def normalize_adj(df: pd.DataFrame, old_code: str) -> pd.DataFrame:
             return pd.DataFrame()
 
     out = df.loc[:, ["date", "adj_factor"]].copy()
-    out["date"] = pd.to_numeric(out["date"], errors="coerce").astype("Int64").astype("string")
-    out["adj_factor"] = pd.to_numeric(out["adj_factor"], errors="coerce")
+    out["date"] = safe_to_numeric(out["date"]).astype("Int64").astype("string")
+    out["adj_factor"] = safe_to_numeric(out["adj_factor"])
     out = out.dropna(subset=["date", "adj_factor"])
     out = out.drop_duplicates(subset=["date"], keep="last").sort_values("date")
     if out.empty:

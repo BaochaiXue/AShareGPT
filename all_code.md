@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import pandas as pd
 
-ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+from model_core.data.io import DEFAULT_ENCODINGS, atomic_write_csv, read_csv_any_encoding
 
 
 @dataclass
@@ -25,8 +27,30 @@ class FileStats:
 
 
 def normalize_date(value: str) -> str:
-    digits = "".join(ch for ch in value if ch.isdigit())
-    return digits if len(digits) == 8 else value.strip()
+    text = value.strip()
+    if not text:
+        return ""
+
+    fmts = (
+        "%Y%m%d",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+    )
+    for fmt in fmts:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 8:
+        try:
+            return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y%m%d")
+        except ValueError:
+            pass
+    return text
 
 
 def is_header(row: List[str]) -> bool:
@@ -38,22 +62,21 @@ def is_header(row: List[str]) -> bool:
 
 
 def read_csv_rows(path: Path) -> Iterable[List[str]]:
-    for enc in ENCODINGS:
-        try:
-            with path.open("r", encoding=enc, errors="strict", newline="") as handle:
-                return list(csv.reader(handle))
-        except UnicodeDecodeError:
-            continue
-    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-        return list(csv.reader(handle))
+    df = read_csv_any_encoding(
+        path,
+        header=None,
+        dtype=str,
+        keep_default_na=False,
+        encodings=DEFAULT_ENCODINGS,
+    )
+    if df.empty:
+        return []
+    return df.fillna("").values.tolist()
 
 
 def write_csv_rows(path: Path, rows: Iterable[Tuple[str, str, str]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(["code", "date", "adj_factor"])
-        for row in rows:
-            writer.writerow(row)
+    out = pd.DataFrame(rows, columns=["code", "date", "adj_factor"])
+    atomic_write_csv(path, out, index=False)
 
 
 def process_file(path: Path, dry_run: bool) -> FileStats:
@@ -111,9 +134,7 @@ def process_file(path: Path, dry_run: bool) -> FileStats:
     )
 
     if not dry_run and stats.changed:
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        write_csv_rows(tmp_path, rows_out)
-        tmp_path.replace(path)
+        write_csv_rows(path, rows_out)
 
     return stats
 
@@ -1424,6 +1445,7 @@ class BacktestResult:
 class TradingPath:
     valid: torch.Tensor
     valid_f: torch.Tensor
+    tradable_f: torch.Tensor
     position: torch.Tensor
     turnover: torch.Tensor
     pnl: torch.Tensor
@@ -1547,7 +1569,7 @@ class ChinaBacktest:
             "flat_ratio": to_float(flat_ratio),
         }
 
-    def _build_position(self, signal: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
+    def _build_position(self, signal: torch.Tensor) -> torch.Tensor:
         if self.allow_short:
             position = torch.sign(signal)
         else:
@@ -1557,16 +1579,91 @@ class ChinaBacktest:
             position = torch.roll(position, self.signal_lag, dims=1)
             position[:, : self.signal_lag] = 0.0
 
-        # Do not hold positions when target return is missing.
-        return position * valid_f
+        return position
 
-    def _compute_turnover(self, position: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
+    def _apply_execution_constraints(
+        self,
+        desired_position: torch.Tensor,
+        tradable_f: torch.Tensor,
+        raw_data: Optional[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        position = torch.zeros_like(desired_position)
+        prev_pos = torch.zeros(
+            desired_position.shape[0],
+            dtype=desired_position.dtype,
+            device=desired_position.device,
+        )
+        locked_buy = torch.zeros_like(prev_pos)
+
+        sell_block = None
+        t_plus_one_required = None
+        session_id = None
+        if raw_data is not None:
+            sell_block = raw_data.get("t_plus_one_sell_block")
+            t_plus_one_required = raw_data.get("t_plus_one_required")
+            session_id = raw_data.get("session_id")
+        if sell_block is not None and sell_block.shape != desired_position.shape:
+            raise ValueError(
+                "raw_data['t_plus_one_sell_block'] must match signal shape [assets, time]."
+            )
+        if t_plus_one_required is not None and t_plus_one_required.shape != desired_position.shape:
+            raise ValueError(
+                "raw_data['t_plus_one_required'] must match signal shape [assets, time]."
+            )
+        if session_id is not None and session_id.shape != desired_position.shape:
+            raise ValueError(
+                "raw_data['session_id'] must match signal shape [assets, time]."
+            )
+
+        if t_plus_one_required is None and sell_block is not None:
+            per_asset_required = (sell_block.max(dim=1, keepdim=True).values > 0).float()
+            t_plus_one_required = per_asset_required.expand_as(desired_position)
+        if t_plus_one_required is None:
+            t_plus_one_required = torch.zeros_like(desired_position)
+        if session_id is None:
+            session_id = torch.zeros_like(desired_position)
+
+        prev_session = session_id[:, 0].clone()
+
+        for t in range(desired_position.shape[1]):
+            current_session = session_id[:, t]
+            if t == 0:
+                session_changed = torch.ones_like(current_session, dtype=torch.bool)
+            else:
+                session_changed = current_session != prev_session
+            locked_buy = torch.where(session_changed, torch.zeros_like(locked_buy), locked_buy)
+
+            desired_t = desired_position[:, t]
+            tradable_t = tradable_f[:, t] > 0
+            t_plus_one_t = t_plus_one_required[:, t] > 0
+
+            if sell_block is not None:
+                blocked_t = sell_block[:, t] > 0
+            else:
+                blocked_t = t_plus_one_t & (~session_changed)
+
+            min_allowed = locked_buy
+            reduce_long = desired_t < min_allowed
+            desired_t = torch.where(blocked_t & reduce_long, min_allowed, desired_t)
+
+            current_pos = torch.where(tradable_t, desired_t, prev_pos)
+
+            buy_increase = torch.clamp(current_pos - prev_pos, min=0.0)
+            locked_buy = torch.where(t_plus_one_t, locked_buy + buy_increase, torch.zeros_like(locked_buy))
+            locked_buy = torch.minimum(locked_buy, torch.clamp(current_pos, min=0.0))
+
+            position[:, t] = current_pos
+            prev_pos = current_pos
+            prev_session = current_session
+
+        return position
+
+    def _compute_turnover(self, position: torch.Tensor, tradable_f: torch.Tensor) -> torch.Tensor:
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
-        # Charge turnover only on bars with realized return; this still costs
-        # re-entry after missing-return gaps (valid -> missing -> valid).
-        return turnover * valid_f
+        # Charge turnover only when market is tradable.
+        return turnover * tradable_f
 
     def _compute_pnl(
         self,
@@ -1575,12 +1672,12 @@ class ChinaBacktest:
         turnover: torch.Tensor,
         target_ret: torch.Tensor,
         raw_data: dict[str, torch.Tensor],
-        valid_f: torch.Tensor,
+        has_return_f: torch.Tensor,
     ) -> torch.Tensor:
         slippage = self._compute_slippage(turnover, raw_data)
         safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
         pnl = position * safe_target - turnover * self.cost_rate - slippage
-        return pnl * valid_f
+        return pnl * has_return_f
 
     def _build_trading_path(
         self,
@@ -1590,18 +1687,30 @@ class ChinaBacktest:
         target_ret: torch.Tensor,
     ) -> TradingPath:
         valid = torch.isfinite(target_ret)
-        valid_f = valid.float()
+        has_return_f = valid.float()
+        if "tradable" in raw_data:
+            tradable_f = torch.nan_to_num(raw_data["tradable"].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            tradable_f = torch.ones_like(has_return_f)
         signal = torch.tanh(factors)
-        position = self._build_position(signal, valid_f)
-        turnover = self._compute_turnover(position, valid_f)
+        desired_position = self._build_position(signal)
+        position = self._apply_execution_constraints(desired_position, tradable_f, raw_data)
+        turnover = self._compute_turnover(position, tradable_f)
         pnl = self._compute_pnl(
             position=position,
             turnover=turnover,
             target_ret=target_ret,
             raw_data=raw_data,
-            valid_f=valid_f,
+            has_return_f=has_return_f,
         )
-        return TradingPath(valid=valid, valid_f=valid_f, position=position, turnover=turnover, pnl=pnl)
+        return TradingPath(
+            valid=valid,
+            valid_f=has_return_f,
+            tradable_f=tradable_f,
+            position=position,
+            turnover=turnover,
+            pnl=pnl,
+        )
 
     def _compute_score(self, path: TradingPath) -> tuple[torch.Tensor, float]:
         valid = path.valid
@@ -1947,6 +2056,16 @@ class ModelConfig:
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
     CN_EXIT_TIME = os.getenv("CN_EXIT_TIME", "15:00")
+    # Execution rule controls:
+    # - CN_ENFORCE_T_PLUS_ONE=1 applies same-day sell blocking by default.
+    # - CN_T0_ALLOWED_CODES can whitelist symbols that are allowed to sell intraday.
+    CN_ENFORCE_T_PLUS_ONE = os.getenv("CN_ENFORCE_T_PLUS_ONE", "1") == "1"
+    _CN_T0_ALLOWED_CODES_RAW = os.getenv("CN_T0_ALLOWED_CODES", "")
+    CN_T0_ALLOWED_CODES = [c.strip() for c in _CN_T0_ALLOWED_CODES_RAW.split(",") if c.strip()]
+    # Decision frequency:
+    # - daily: aggregate minute data to one bar per day.
+    # - 1min: keep minute bars as the decision timeline.
+    CN_DECISION_FREQ = os.getenv("CN_DECISION_FREQ", "daily").strip().lower()
     # Bar/return semantics:
     # - CN_BAR_STYLE=daily         -> full-session OHLCV bars.
     # - CN_BAR_STYLE=signal_snapshot -> legacy single-minute snapshot bars.
@@ -1955,6 +2074,7 @@ class ModelConfig:
     # - CN_TARGET_RET_MODE=signal_to_exit -> legacy same-day signal_time->exit_time return.
     CN_TARGET_RET_MODE = os.getenv("CN_TARGET_RET_MODE", "close_to_close").strip().lower()
     CN_HOLD_DAYS = int(os.getenv("CN_HOLD_DAYS", "1"))
+    CN_HOLD_BARS = int(os.getenv("CN_HOLD_BARS", "1"))
     CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
@@ -1980,6 +2100,111 @@ class ModelConfig:
     ]
 ```
 
+model_core/data/__init__.py
+```python
+"""Data utilities and repositories."""
+
+from .io import (
+    DEFAULT_ENCODINGS,
+    atomic_write_csv,
+    read_csv_any_encoding,
+    read_last_row_token,
+    safe_to_datetime,
+    safe_to_numeric,
+)
+
+__all__ = [
+    "DEFAULT_ENCODINGS",
+    "atomic_write_csv",
+    "read_csv_any_encoding",
+    "read_last_row_token",
+    "safe_to_datetime",
+    "safe_to_numeric",
+]
+```
+
+model_core/data/io.py
+```python
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+import pandas as pd
+
+DEFAULT_ENCODINGS: tuple[str, ...] = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+
+
+def read_csv_any_encoding(
+    path: Path,
+    *,
+    usecols: Any = None,
+    dtype: Any = None,
+    encodings: Iterable[str] = DEFAULT_ENCODINGS,
+    **kwargs: Any,
+) -> pd.DataFrame:
+    """Read CSV by trying common encodings in order."""
+
+    last_err: Optional[Exception] = None
+    for encoding in encodings:
+        try:
+            return pd.read_csv(path, usecols=usecols, dtype=dtype, encoding=encoding, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - fallback reader intentionally retries broadly
+            last_err = exc
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"failed to read csv: {path}")
+
+
+def safe_to_datetime(series: pd.Series, *, utc: bool = False) -> pd.Series:
+    """Convert to datetime with invalid values coerced to NaT."""
+
+    try:
+        return pd.to_datetime(series, errors="coerce", utc=utc, format="mixed")
+    except TypeError:
+        return pd.to_datetime(series, errors="coerce", utc=utc)
+
+
+def safe_to_numeric(series: pd.Series) -> pd.Series:
+    """Convert to numeric with invalid values coerced to NaN."""
+
+    return pd.to_numeric(series, errors="coerce")
+
+
+def atomic_write_csv(path: Path, df: pd.DataFrame, *, index: bool = False, **kwargs: Any) -> None:
+    """Write CSV atomically via a temporary file in the same directory."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp_path, index=index, **kwargs)
+    tmp_path.replace(path)
+
+
+def read_last_row_token(path: Path, key_col: str) -> Optional[str]:
+    """Return the last non-empty value for `key_col` from a UTF-8 CSV file."""
+
+    if not path.exists():
+        return None
+
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header or key_col not in header:
+            return None
+        key_idx = header.index(key_col)
+
+        last_value: Optional[str] = None
+        for row in reader:
+            if key_idx >= len(row):
+                continue
+            value = row[key_idx].strip()
+            if value:
+                last_value = value
+
+    return last_value
+```
+
 model_core/data_loader.py
 ```python
 from dataclasses import dataclass
@@ -1992,7 +2217,9 @@ import torch
 
 from .config import ModelConfig
 from .code_alias import load_code_alias_map
+from .data.io import read_csv_any_encoding
 from .factors import FeatureEngineer
+from .market.cn_rules import ChinaMarketRules
 
 
 @dataclass
@@ -2017,6 +2244,7 @@ class ChinaMinuteDataLoader:
     """
     Minute-level data loader for China A-share/ETF.
     Builds decision tensors from minute bars with configurable:
+    - decision frequency (`daily` vs `1min`)
     - bar semantics (`daily` vs `signal_snapshot`)
     - return semantics (`close_to_close` vs `signal_to_exit`)
     """
@@ -2048,6 +2276,16 @@ class ChinaMinuteDataLoader:
                 return None
 
     @staticmethod
+    def _resolve_decision_freq() -> str:
+        freq = ModelConfig.CN_DECISION_FREQ.strip().lower()
+        if freq not in {"daily", "1min"}:
+            raise ValueError(
+                f"Unsupported CN_DECISION_FREQ={ModelConfig.CN_DECISION_FREQ!r}; "
+                "expected 'daily' or '1min'."
+            )
+        return freq
+
+    @staticmethod
     def _resolve_bar_style() -> str:
         style = ModelConfig.CN_BAR_STYLE.strip().lower()
         if style not in {"daily", "signal_snapshot"}:
@@ -2058,13 +2296,23 @@ class ChinaMinuteDataLoader:
         return style
 
     @staticmethod
-    def _resolve_target_ret_mode() -> tuple[str, int]:
+    def _resolve_target_ret_mode(decision_freq: str = "daily") -> tuple[str, int]:
         mode = ModelConfig.CN_TARGET_RET_MODE.strip().lower()
         if mode not in {"close_to_close", "signal_to_exit"}:
             raise ValueError(
                 f"Unsupported CN_TARGET_RET_MODE={ModelConfig.CN_TARGET_RET_MODE!r}; "
                 "expected 'close_to_close' or 'signal_to_exit'."
             )
+        if decision_freq == "1min":
+            if mode != "close_to_close":
+                raise ValueError(
+                    "CN_DECISION_FREQ='1min' currently supports only CN_TARGET_RET_MODE='close_to_close'."
+                )
+            hold_bars = int(ModelConfig.CN_HOLD_BARS)
+            if hold_bars < 1:
+                raise ValueError("CN_HOLD_BARS must be >= 1 when CN_DECISION_FREQ='1min'.")
+            return mode, hold_bars
+
         if mode == "signal_to_exit":
             return mode, 0
 
@@ -2114,21 +2362,11 @@ class ChinaMinuteDataLoader:
         return candidates[:limit_codes] if limit_codes else candidates
 
     def _read_adj_factor_csv(self, path: Path) -> pd.DataFrame:
-        encodings = ("utf-8", "utf-8-sig", "gbk", "gb18030")
-        last_err: Optional[Exception] = None
-        for enc in encodings:
-            try:
-                return pd.read_csv(
-                    path,
-                    usecols=lambda c: c in {"date", "adj_factor", "code", "证券代码"},
-                    dtype={"date": "string"},
-                    encoding=enc,
-                )
-            except Exception as exc:
-                last_err = exc
-        if last_err:
-            raise last_err
-        return pd.DataFrame()
+        return read_csv_any_encoding(
+            path,
+            usecols=lambda c: c in {"date", "adj_factor", "code", "证券代码"},
+            dtype={"date": "string"},
+        )
 
     def _load_adj_factors(self, code: str) -> Optional[pd.DataFrame]:
         if not ModelConfig.CN_USE_ADJ_FACTOR:
@@ -2371,73 +2609,140 @@ class ChinaMinuteDataLoader:
         bar_style: str,
         target_ret_mode: str,
     ) -> list[dict[str, float | pd.Timestamp]]:
+        minute_df = self._load_minute_frame_for_code(
+            code=code,
+            years=years,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            end_dt_exclusive=end_dt_exclusive,
+        )
+        if minute_df.empty:
+            return []
+
         records: list[dict[str, float | pd.Timestamp]] = []
+        for date, day_frame in minute_df.groupby("date"):
+            day_frame = day_frame.sort_values("trade_time")
+            time_series = day_frame["trade_time"].dt.time
+            entry_candidates = day_frame[time_series >= sig_time]
+            entry_row = entry_candidates.iloc[0] if not entry_candidates.empty else day_frame.iloc[0]
+
+            if exit_t:
+                exit_candidates = day_frame[time_series >= exit_t]
+                exit_row = exit_candidates.iloc[0] if not exit_candidates.empty else day_frame.iloc[-1]
+            else:
+                exit_row = day_frame.iloc[-1]
+
+            if bar_style == "daily":
+                rec = {
+                    "date": date,
+                    "open": float(day_frame.iloc[0]["open"]),
+                    "high": float(day_frame["high"].max()),
+                    "low": float(day_frame["low"].min()),
+                    "close": float(day_frame.iloc[-1]["close"]),
+                    "volume": float(day_frame["vol"].sum()),
+                    "amount": float(day_frame["amount"].sum()),
+                }
+            else:
+                rec = {
+                    "date": date,
+                    "open": float(entry_row["open"]),
+                    "high": float(entry_row["high"]),
+                    "low": float(entry_row["low"]),
+                    "close": float(entry_row["close"]),
+                    "volume": float(entry_row["vol"]),
+                    "amount": float(entry_row["amount"]),
+                }
+
+            if target_ret_mode == "signal_to_exit":
+                entry_open = float(entry_row["open"])
+                exit_close = float(exit_row["close"])
+                if entry_open == 0:
+                    continue
+                rec["target_ret"] = (exit_close / entry_open) - 1.0
+
+            records.append(rec)
+        return records
+
+    def _load_minute_frame_for_code(
+        self,
+        *,
+        code: str,
+        years: list[int],
+        start_dt: Optional[pd.Timestamp],
+        end_dt: Optional[pd.Timestamp],
+        end_dt_exclusive: Optional[pd.Timestamp],
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
         for year in years:
             path = self.data_root / str(year) / f"{code}.csv"
             if not path.exists():
                 continue
-            df = pd.read_csv(
+            df = read_csv_any_encoding(
                 path,
                 usecols=["trade_time", "open", "high", "low", "close", "vol", "amount"],
                 dtype={"trade_time": "string"},
             )
             if df.empty:
                 continue
-            df["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
-            df = df.dropna(subset=["trade_time"])
-            if start_dt is not None:
-                df = df[df["trade_time"] >= start_dt]
-            if end_dt_exclusive is not None:
-                # Date-only end bounds are inclusive of the whole end day.
-                df = df[df["trade_time"] < end_dt_exclusive]
-            elif end_dt is not None:
-                df = df[df["trade_time"] <= end_dt]
-            if df.empty:
-                continue
-            df["date"] = df["trade_time"].dt.normalize()
+            frames.append(df)
 
-            for date, day_frame in df.groupby("date"):
-                day_frame = day_frame.sort_values("trade_time")
-                time_series = day_frame["trade_time"].dt.time
-                entry_candidates = day_frame[time_series >= sig_time]
-                entry_row = entry_candidates.iloc[0] if not entry_candidates.empty else day_frame.iloc[0]
+        if not frames:
+            return pd.DataFrame()
 
-                if exit_t:
-                    exit_candidates = day_frame[time_series >= exit_t]
-                    exit_row = exit_candidates.iloc[0] if not exit_candidates.empty else day_frame.iloc[-1]
-                else:
-                    exit_row = day_frame.iloc[-1]
+        minute_df = pd.concat(frames, ignore_index=True)
+        minute_df["trade_time"] = pd.to_datetime(minute_df["trade_time"], errors="coerce")
+        minute_df = minute_df.dropna(subset=["trade_time"])
+        if minute_df.empty:
+            return minute_df
 
-                if bar_style == "daily":
-                    rec = {
-                        "date": date,
-                        "open": float(day_frame.iloc[0]["open"]),
-                        "high": float(day_frame["high"].max()),
-                        "low": float(day_frame["low"].min()),
-                        "close": float(day_frame.iloc[-1]["close"]),
-                        "volume": float(day_frame["vol"].sum()),
-                        "amount": float(day_frame["amount"].sum()),
-                    }
-                else:
-                    rec = {
-                        "date": date,
-                        "open": float(entry_row["open"]),
-                        "high": float(entry_row["high"]),
-                        "low": float(entry_row["low"]),
-                        "close": float(entry_row["close"]),
-                        "volume": float(entry_row["vol"]),
-                        "amount": float(entry_row["amount"]),
-                    }
+        if start_dt is not None:
+            minute_df = minute_df[minute_df["trade_time"] >= start_dt]
+        if end_dt_exclusive is not None:
+            minute_df = minute_df[minute_df["trade_time"] < end_dt_exclusive]
+        elif end_dt is not None:
+            minute_df = minute_df[minute_df["trade_time"] <= end_dt]
+        if minute_df.empty:
+            return minute_df
 
-                if target_ret_mode == "signal_to_exit":
-                    entry_open = float(entry_row["open"])
-                    exit_close = float(exit_row["close"])
-                    if entry_open == 0:
-                        continue
-                    rec["target_ret"] = (exit_close / entry_open) - 1.0
+        for col in ("open", "high", "low", "close", "vol", "amount"):
+            minute_df[col] = pd.to_numeric(minute_df[col], errors="coerce")
+        minute_df = minute_df.dropna(subset=["open", "high", "low", "close", "vol", "amount"])
+        minute_df = minute_df.sort_values("trade_time").drop_duplicates(subset=["trade_time"], keep="last")
+        minute_df["date"] = minute_df["trade_time"].dt.normalize()
+        return minute_df
 
-                records.append(rec)
-        return records
+    def _load_minute_records_for_code(
+        self,
+        *,
+        code: str,
+        years: list[int],
+        start_dt: Optional[pd.Timestamp],
+        end_dt: Optional[pd.Timestamp],
+        end_dt_exclusive: Optional[pd.Timestamp],
+    ) -> list[dict[str, float | pd.Timestamp]]:
+        minute_df = self._load_minute_frame_for_code(
+            code=code,
+            years=years,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            end_dt_exclusive=end_dt_exclusive,
+        )
+        if minute_df.empty:
+            return []
+
+        return [
+            {
+                "trade_time": row.trade_time,
+                "date": row.date,
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+                "volume": float(row.vol),
+                "amount": float(row.amount),
+            }
+            for row in minute_df.itertuples(index=False)
+        ]
 
     def _build_per_code_frames(
         self,
@@ -2452,24 +2757,37 @@ class ChinaMinuteDataLoader:
         bar_style: str,
         target_ret_mode: str,
         hold_days: int,
+        decision_freq: str = "daily",
     ) -> dict[str, pd.DataFrame]:
         per_code_frames: dict[str, pd.DataFrame] = {}
         for code in codes:
-            records = self._load_daily_records_for_code(
-                code=code,
-                years=years,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                end_dt_exclusive=end_dt_exclusive,
-                sig_time=sig_time,
-                exit_t=exit_t,
-                bar_style=bar_style,
-                target_ret_mode=target_ret_mode,
-            )
+            if decision_freq == "1min":
+                records = self._load_minute_records_for_code(
+                    code=code,
+                    years=years,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    end_dt_exclusive=end_dt_exclusive,
+                )
+            else:
+                records = self._load_daily_records_for_code(
+                    code=code,
+                    years=years,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    end_dt_exclusive=end_dt_exclusive,
+                    sig_time=sig_time,
+                    exit_t=exit_t,
+                    bar_style=bar_style,
+                    target_ret_mode=target_ret_mode,
+                )
             if not records:
                 continue
             frame = pd.DataFrame(records)
-            frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+            if decision_freq == "1min":
+                frame = frame.drop_duplicates(subset=["trade_time"], keep="last").sort_values("trade_time")
+            else:
+                frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
             if target_ret_mode == "close_to_close":
@@ -2482,17 +2800,28 @@ class ChinaMinuteDataLoader:
         per_code_frames: dict[str, pd.DataFrame],
         *,
         end_dt: Optional[pd.Timestamp],
+        decision_freq: str = "daily",
     ) -> None:
         if end_dt is not None or not ModelConfig.CN_MINUTE_DAYS:
             return
         cutoff_days = ModelConfig.CN_MINUTE_DAYS
         for code, frame in list(per_code_frames.items()):
-            frame = frame.sort_values("date")
-            if len(frame) > cutoff_days:
+            frame = frame.sort_values("trade_time" if decision_freq == "1min" else "date")
+            if decision_freq == "1min":
+                unique_days = frame["date"].drop_duplicates().sort_values()
+                if len(unique_days) > cutoff_days:
+                    keep_days = set(unique_days.iloc[-cutoff_days:].tolist())
+                    frame = frame[frame["date"].isin(keep_days)]
+            elif len(frame) > cutoff_days:
                 frame = frame.iloc[-cutoff_days:]
             per_code_frames[code] = frame
 
-    def _build_pivots(self, per_code_frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    def _build_pivots(
+        self,
+        per_code_frames: dict[str, pd.DataFrame],
+        *,
+        index_col: str = "date",
+    ) -> dict[str, pd.DataFrame]:
         def build_pivot(
             field: str,
             *,
@@ -2501,7 +2830,10 @@ class ChinaMinuteDataLoader:
         ) -> pd.DataFrame:
             series_list = []
             for code, frame in per_code_frames.items():
-                s = frame.set_index("date")[field].rename(code)
+                if field == "tradable":
+                    s = pd.Series(1.0, index=frame[index_col], name=code)
+                else:
+                    s = frame.set_index(index_col)[field].rename(code)
                 series_list.append(s)
             pivot = pd.concat(series_list, axis=1).sort_index()
             if ffill:
@@ -2518,6 +2850,7 @@ class ChinaMinuteDataLoader:
             "volume": (False, 0.0),
             "amount": (False, 0.0),
             "target_ret": (False, None),
+            "tradable": (False, 0.0),
         }
         pivots = {
             field: build_pivot(field, ffill=ffill, fill_value=fill_value)
@@ -2554,6 +2887,7 @@ class ChinaMinuteDataLoader:
             "close": self._pivot_to_tensor(pivots["close"], index=index, columns=columns),
             "volume": self._pivot_to_tensor(pivots["volume"], index=index, columns=columns),
             "amount": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
+            "tradable": self._pivot_to_tensor(pivots["tradable"], index=index, columns=columns),
             "liquidity": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
             "fdv": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
         }
@@ -2564,6 +2898,34 @@ class ChinaMinuteDataLoader:
                 columns=columns,
             )
         return raw_data_cache, target_tensor
+
+    def _attach_execution_rule_tensors(
+        self,
+        *,
+        raw_data_cache: dict[str, torch.Tensor],
+        index: pd.DatetimeIndex,
+        symbols: list[str],
+        decision_freq: str,
+    ) -> None:
+        rules = ChinaMarketRules.from_config()
+        session_ids = rules.build_session_id_matrix(
+            dates=index,
+            num_assets=len(symbols),
+            device=ModelConfig.DEVICE,
+        )
+        t_plus_one_required = rules.t_plus_one_required_matrix(
+            symbols=symbols,
+            num_steps=len(index),
+            device=ModelConfig.DEVICE,
+        )
+        t_plus_one_sell_block = rules.build_t_plus_one_sell_block(
+            session_ids=session_ids,
+            t_plus_one_required=t_plus_one_required,
+            decision_freq=decision_freq,
+        )
+        raw_data_cache["session_id"] = session_ids
+        raw_data_cache["t_plus_one_required"] = t_plus_one_required
+        raw_data_cache["t_plus_one_sell_block"] = t_plus_one_sell_block
 
     def load_data(
         self,
@@ -2585,8 +2947,9 @@ class ChinaMinuteDataLoader:
 
         sig_time = self._parse_time(signal_time or ModelConfig.CN_SIGNAL_TIME) or time(10, 0)
         exit_t = self._parse_time(exit_time or ModelConfig.CN_EXIT_TIME)
+        decision_freq = self._resolve_decision_freq()
         bar_style = self._resolve_bar_style()
-        target_ret_mode, hold_days = self._resolve_target_ret_mode()
+        target_ret_mode, hold_period = self._resolve_target_ret_mode(decision_freq)
         start_dt, end_dt, end_dt_exclusive = self._resolve_time_bounds(start_date, end_date)
         per_code_frames = self._build_per_code_frames(
             codes=codes,
@@ -2598,14 +2961,16 @@ class ChinaMinuteDataLoader:
             exit_t=exit_t,
             bar_style=bar_style,
             target_ret_mode=target_ret_mode,
-            hold_days=hold_days,
+            hold_days=hold_period,
+            decision_freq=decision_freq,
         )
 
         if not per_code_frames:
             raise ValueError("No minute data loaded. Check codes/years/date filters.")
 
-        self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt)
-        pivots = self._build_pivots(per_code_frames)
+        self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt, decision_freq=decision_freq)
+        index_col = "trade_time" if decision_freq == "1min" else "date"
+        pivots = self._build_pivots(per_code_frames, index_col=index_col)
 
         index = pivots["close"].index
         columns = pivots["close"].columns
@@ -2615,6 +2980,12 @@ class ChinaMinuteDataLoader:
             pivots,
             index=index,
             columns=columns,
+        )
+        self._attach_execution_rule_tensors(
+            raw_data_cache=self.raw_data_cache,
+            index=index,
+            symbols=list(columns),
+            decision_freq=decision_freq,
         )
 
         raw_feat = FeatureEngineer.compute_features(
@@ -2630,13 +3001,16 @@ class ChinaMinuteDataLoader:
 
         print(f"CN Minute Data Ready. Shape: {self.feat_tensor.shape}")
         if target_ret_mode == "close_to_close":
-            print(f"[ret] mode=close_to_close hold_days={hold_days}")
+            hold_label = "hold_bars" if decision_freq == "1min" else "hold_days"
+            print(f"[ret] mode=close_to_close {hold_label}={hold_period}")
         else:
             print(
                 f"[ret] mode=signal_to_exit signal_time={sig_time.strftime('%H:%M:%S')} "
                 f"exit_time={(exit_t.strftime('%H:%M:%S') if exit_t else 'eod')}"
             )
-        print(f"[bar] style={bar_style}")
+        print(f"[decision] freq={decision_freq}")
+        if decision_freq != "1min":
+            print(f"[bar] style={bar_style}")
         if self.feature_norm_info:
             print(
                 "[norm] mode={mode} fit_len={fit_len} clip={clip}".format(
@@ -3547,6 +3921,102 @@ class LegacyAlphaTrainer:
         )
 ```
 
+model_core/market/__init__.py
+```python
+"""China market rule helpers."""
+
+from .cn_rules import ChinaMarketRules
+
+__all__ = ["ChinaMarketRules"]
+```
+
+model_core/market/cn_rules.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from model_core.config import ModelConfig
+
+
+def _normalize_code(code: str) -> str:
+    return code.strip().upper()
+
+
+@dataclass(frozen=True)
+class ChinaMarketRules:
+    """
+    Minimal execution-rule layer for CN equities/ETFs.
+
+    The default is conservative: enforce T+1 for all symbols unless explicitly
+    whitelisted in CN_T0_ALLOWED_CODES.
+    """
+
+    enforce_t_plus_one: bool
+    t0_allowed_codes: frozenset[str]
+
+    @classmethod
+    def from_config(cls) -> "ChinaMarketRules":
+        return cls(
+            enforce_t_plus_one=bool(ModelConfig.CN_ENFORCE_T_PLUS_ONE),
+            t0_allowed_codes=frozenset(_normalize_code(c) for c in ModelConfig.CN_T0_ALLOWED_CODES),
+        )
+
+    def is_t_plus_one(self, code: str) -> bool:
+        if not self.enforce_t_plus_one:
+            return False
+        return _normalize_code(code) not in self.t0_allowed_codes
+
+    def t_plus_one_required_matrix(
+        self,
+        *,
+        symbols: list[str],
+        num_steps: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        per_symbol = torch.tensor(
+            [1.0 if self.is_t_plus_one(code) else 0.0 for code in symbols],
+            dtype=torch.float32,
+            device=device,
+        ).unsqueeze(1)
+        if num_steps <= 0:
+            return per_symbol[:, :0]
+        return per_symbol.expand(-1, num_steps)
+
+    @staticmethod
+    def build_session_id_matrix(
+        *,
+        dates,
+        num_assets: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # Session id is based on calendar day. This works for daily and minute timelines.
+        session_codes, _ = dates.normalize().factorize(sort=False)
+        session_1d = torch.tensor(session_codes, dtype=torch.float32, device=device).unsqueeze(0)
+        if num_assets <= 0:
+            return session_1d[:0]
+        return session_1d.expand(num_assets, -1)
+
+    @staticmethod
+    def build_t_plus_one_sell_block(
+        *,
+        session_ids: torch.Tensor,
+        t_plus_one_required: torch.Tensor,
+        decision_freq: str,
+    ) -> torch.Tensor:
+        block = torch.zeros_like(t_plus_one_required)
+        if t_plus_one_required.numel() == 0:
+            return block
+        if decision_freq != "1min":
+            return block
+
+        same_session = (session_ids[:, 1:] == session_ids[:, :-1]).float()
+        block[:, 1:] = same_session * t_plus_one_required[:, 1:]
+        return block
+```
+
 model_core/neural_symbolic_alpha_generator.py
 ```python
 
@@ -4412,7 +4882,6 @@ import argparse
 import csv
 import sys
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -4421,26 +4890,15 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from model_core.code_alias import load_code_alias_map  # noqa: E402
-
-
-ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+from model_core.data.io import read_csv_any_encoding, safe_to_numeric  # noqa: E402
 
 
 def read_adj_csv(path: Path) -> pd.DataFrame:
-    last_err: Optional[Exception] = None
-    for enc in ENCODINGS:
-        try:
-            return pd.read_csv(
-                path,
-                usecols=lambda c: c in {"code", "date", "adj_factor", "证券代码"},
-                dtype={"date": "string"},
-                encoding=enc,
-            )
-        except Exception as exc:
-            last_err = exc
-    if last_err is not None:
-        raise last_err
-    return pd.DataFrame()
+    return read_csv_any_encoding(
+        path,
+        usecols=lambda c: c in {"code", "date", "adj_factor", "证券代码"},
+        dtype={"date": "string"},
+    )
 
 
 def collect_minute_codes(data_root: Path) -> set[str]:
@@ -4463,8 +4921,8 @@ def normalize_adj(df: pd.DataFrame, old_code: str) -> pd.DataFrame:
             return pd.DataFrame()
 
     out = df.loc[:, ["date", "adj_factor"]].copy()
-    out["date"] = pd.to_numeric(out["date"], errors="coerce").astype("Int64").astype("string")
-    out["adj_factor"] = pd.to_numeric(out["adj_factor"], errors="coerce")
+    out["date"] = safe_to_numeric(out["date"]).astype("Int64").astype("string")
+    out["adj_factor"] = safe_to_numeric(out["adj_factor"])
     out = out.dropna(subset=["date", "adj_factor"])
     out = out.drop_duplicates(subset=["date"], keep="last").sort_values("date")
     if out.empty:
@@ -4600,66 +5058,23 @@ unify_data.py
 from __future__ import annotations
 
 import argparse
-import csv
-import os
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 import pandas as pd
 
-
-def read_last_line(path: Path) -> str:
-    if not path.exists():
-        return ""
-    with path.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        if size == 0:
-            return ""
-        block = 4096
-        offset = min(size, block)
-        while True:
-            f.seek(size - offset)
-            chunk = f.read(offset)
-            if b"\n" in chunk or size == offset:
-                lines = chunk.splitlines()
-                return lines[-1].decode("utf-8", errors="ignore") if lines else ""
-            offset = min(size, offset * 2)
+from model_core.data.io import (
+    read_csv_any_encoding,
+    read_last_row_token,
+    safe_to_datetime,
+)
 
 
-def get_last_token(path: Path, expect_time: bool, time_col: str) -> Optional[str]:
-    if not path.exists():
-        return None
-    line = read_last_line(path)
-    if not line:
-        return None
-    col_idx = 0
-    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
-        header = next(csv.reader(handle), None)
-        if header and time_col in header:
-            col_idx = header.index(time_col)
-    row = next(csv.reader([line]), [])
-    if col_idx >= len(row):
-        return None
-    token = row[col_idx].strip()
-    if expect_time:
-        if len(token) >= 10 and token[:4].isdigit():
-            return token
-        return None
-    if token.isdigit() and len(token) >= 8:
-        return token
-    return None
-
-
-def read_csv_fallback(path: Path, *, dtype: dict, usecols) -> pd.DataFrame:
-    encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030"]
-    last_err: Optional[Exception] = None
-    for enc in encodings:
-        try:
-            return pd.read_csv(path, dtype=dtype, usecols=usecols, encoding=enc)
-        except Exception as exc:
-            last_err = exc
-    raise last_err if last_err else RuntimeError(f"read_csv failed for {path}")
+def _build_time_key(values: pd.Series, *, expect_time: bool) -> pd.Series:
+    key = safe_to_datetime(values)
+    if not expect_time:
+        key = key.dt.normalize()
+    return key
 
 
 def append_group(
@@ -4675,15 +5090,21 @@ def append_group(
     group = group.loc[:, cols].copy()
     group = group.dropna(subset=[time_col])
     group = group.drop_duplicates(subset=[time_col], keep="last")
+    group["_time_key"] = _build_time_key(group[time_col], expect_time=expect_time)
+    group = group.dropna(subset=["_time_key"])
 
-    last_token = get_last_token(output_path, expect_time=expect_time, time_col=time_col)
+    last_token = read_last_row_token(output_path, time_col)
     if last_token:
-        group = group[group[time_col] > last_token]
+        last_key = safe_to_datetime(pd.Series([last_token])).iloc[0]
+        if pd.notna(last_key):
+            if not expect_time:
+                last_key = last_key.normalize()
+            group = group[group["_time_key"] > last_key]
 
     if group.empty:
         return 0
 
-    group = group.sort_values(time_col)
+    group = group.sort_values("_time_key").drop(columns=["_time_key"])
     header = not output_path.exists()
 
     if not dry_run:
@@ -4711,7 +5132,7 @@ def process_minute_data(minute_root: Path, data_root: Path, dry_run: bool, max_f
         rel = path.relative_to(minute_root)
         year = rel.parts[0] if rel.parts else path.stem.split("-")[0]
 
-        df = read_csv_fallback(
+        df = read_csv_any_encoding(
             path,
             dtype={"证券代码": "string", "code": "string", "trade_time": "string"},
             usecols=lambda c: c in {"证券代码", "code", "trade_time", "open", "high", "low", "close", "vol", "amount"},
@@ -4750,7 +5171,7 @@ def process_adj_factors(adj_root: Path, data_root: Path, dry_run: bool, max_file
     for path in files:
         total_files += 1
 
-        df = read_csv_fallback(
+        df = read_csv_any_encoding(
             path,
             dtype={"证券代码": "string", "code": "string", "date": "string"},
             usecols=lambda c: c in {"证券代码", "code", "date", "adj_factor"},

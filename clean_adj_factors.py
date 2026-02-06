@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import pandas as pd
 
-ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+from model_core.data.io import DEFAULT_ENCODINGS, atomic_write_csv, read_csv_any_encoding
 
 
 @dataclass
@@ -23,8 +25,30 @@ class FileStats:
 
 
 def normalize_date(value: str) -> str:
-    digits = "".join(ch for ch in value if ch.isdigit())
-    return digits if len(digits) == 8 else value.strip()
+    text = value.strip()
+    if not text:
+        return ""
+
+    fmts = (
+        "%Y%m%d",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+    )
+    for fmt in fmts:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 8:
+        try:
+            return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y%m%d")
+        except ValueError:
+            pass
+    return text
 
 
 def is_header(row: List[str]) -> bool:
@@ -36,22 +60,21 @@ def is_header(row: List[str]) -> bool:
 
 
 def read_csv_rows(path: Path) -> Iterable[List[str]]:
-    for enc in ENCODINGS:
-        try:
-            with path.open("r", encoding=enc, errors="strict", newline="") as handle:
-                return list(csv.reader(handle))
-        except UnicodeDecodeError:
-            continue
-    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-        return list(csv.reader(handle))
+    df = read_csv_any_encoding(
+        path,
+        header=None,
+        dtype=str,
+        keep_default_na=False,
+        encodings=DEFAULT_ENCODINGS,
+    )
+    if df.empty:
+        return []
+    return df.fillna("").values.tolist()
 
 
 def write_csv_rows(path: Path, rows: Iterable[Tuple[str, str, str]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(["code", "date", "adj_factor"])
-        for row in rows:
-            writer.writerow(row)
+    out = pd.DataFrame(rows, columns=["code", "date", "adj_factor"])
+    atomic_write_csv(path, out, index=False)
 
 
 def process_file(path: Path, dry_run: bool) -> FileStats:
@@ -109,9 +132,7 @@ def process_file(path: Path, dry_run: bool) -> FileStats:
     )
 
     if not dry_run and stats.changed:
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        write_csv_rows(tmp_path, rows_out)
-        tmp_path.replace(path)
+        write_csv_rows(path, rows_out)
 
     return stats
 

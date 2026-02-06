@@ -20,6 +20,7 @@ class BacktestResult:
 class TradingPath:
     valid: torch.Tensor
     valid_f: torch.Tensor
+    tradable_f: torch.Tensor
     position: torch.Tensor
     turnover: torch.Tensor
     pnl: torch.Tensor
@@ -143,7 +144,7 @@ class ChinaBacktest:
             "flat_ratio": to_float(flat_ratio),
         }
 
-    def _build_position(self, signal: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
+    def _build_position(self, signal: torch.Tensor) -> torch.Tensor:
         if self.allow_short:
             position = torch.sign(signal)
         else:
@@ -153,16 +154,91 @@ class ChinaBacktest:
             position = torch.roll(position, self.signal_lag, dims=1)
             position[:, : self.signal_lag] = 0.0
 
-        # Do not hold positions when target return is missing.
-        return position * valid_f
+        return position
 
-    def _compute_turnover(self, position: torch.Tensor, valid_f: torch.Tensor) -> torch.Tensor:
+    def _apply_execution_constraints(
+        self,
+        desired_position: torch.Tensor,
+        tradable_f: torch.Tensor,
+        raw_data: Optional[dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        position = torch.zeros_like(desired_position)
+        prev_pos = torch.zeros(
+            desired_position.shape[0],
+            dtype=desired_position.dtype,
+            device=desired_position.device,
+        )
+        locked_buy = torch.zeros_like(prev_pos)
+
+        sell_block = None
+        t_plus_one_required = None
+        session_id = None
+        if raw_data is not None:
+            sell_block = raw_data.get("t_plus_one_sell_block")
+            t_plus_one_required = raw_data.get("t_plus_one_required")
+            session_id = raw_data.get("session_id")
+        if sell_block is not None and sell_block.shape != desired_position.shape:
+            raise ValueError(
+                "raw_data['t_plus_one_sell_block'] must match signal shape [assets, time]."
+            )
+        if t_plus_one_required is not None and t_plus_one_required.shape != desired_position.shape:
+            raise ValueError(
+                "raw_data['t_plus_one_required'] must match signal shape [assets, time]."
+            )
+        if session_id is not None and session_id.shape != desired_position.shape:
+            raise ValueError(
+                "raw_data['session_id'] must match signal shape [assets, time]."
+            )
+
+        if t_plus_one_required is None and sell_block is not None:
+            per_asset_required = (sell_block.max(dim=1, keepdim=True).values > 0).float()
+            t_plus_one_required = per_asset_required.expand_as(desired_position)
+        if t_plus_one_required is None:
+            t_plus_one_required = torch.zeros_like(desired_position)
+        if session_id is None:
+            session_id = torch.zeros_like(desired_position)
+
+        prev_session = session_id[:, 0].clone()
+
+        for t in range(desired_position.shape[1]):
+            current_session = session_id[:, t]
+            if t == 0:
+                session_changed = torch.ones_like(current_session, dtype=torch.bool)
+            else:
+                session_changed = current_session != prev_session
+            locked_buy = torch.where(session_changed, torch.zeros_like(locked_buy), locked_buy)
+
+            desired_t = desired_position[:, t]
+            tradable_t = tradable_f[:, t] > 0
+            t_plus_one_t = t_plus_one_required[:, t] > 0
+
+            if sell_block is not None:
+                blocked_t = sell_block[:, t] > 0
+            else:
+                blocked_t = t_plus_one_t & (~session_changed)
+
+            min_allowed = locked_buy
+            reduce_long = desired_t < min_allowed
+            desired_t = torch.where(blocked_t & reduce_long, min_allowed, desired_t)
+
+            current_pos = torch.where(tradable_t, desired_t, prev_pos)
+
+            buy_increase = torch.clamp(current_pos - prev_pos, min=0.0)
+            locked_buy = torch.where(t_plus_one_t, locked_buy + buy_increase, torch.zeros_like(locked_buy))
+            locked_buy = torch.minimum(locked_buy, torch.clamp(current_pos, min=0.0))
+
+            position[:, t] = current_pos
+            prev_pos = current_pos
+            prev_session = current_session
+
+        return position
+
+    def _compute_turnover(self, position: torch.Tensor, tradable_f: torch.Tensor) -> torch.Tensor:
         prev_pos = torch.roll(position, 1, dims=1)
         prev_pos[:, 0] = 0.0
         turnover = torch.abs(position - prev_pos)
-        # Charge turnover only on bars with realized return; this still costs
-        # re-entry after missing-return gaps (valid -> missing -> valid).
-        return turnover * valid_f
+        # Charge turnover only when market is tradable.
+        return turnover * tradable_f
 
     def _compute_pnl(
         self,
@@ -171,12 +247,12 @@ class ChinaBacktest:
         turnover: torch.Tensor,
         target_ret: torch.Tensor,
         raw_data: dict[str, torch.Tensor],
-        valid_f: torch.Tensor,
+        has_return_f: torch.Tensor,
     ) -> torch.Tensor:
         slippage = self._compute_slippage(turnover, raw_data)
         safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
         pnl = position * safe_target - turnover * self.cost_rate - slippage
-        return pnl * valid_f
+        return pnl * has_return_f
 
     def _build_trading_path(
         self,
@@ -186,18 +262,30 @@ class ChinaBacktest:
         target_ret: torch.Tensor,
     ) -> TradingPath:
         valid = torch.isfinite(target_ret)
-        valid_f = valid.float()
+        has_return_f = valid.float()
+        if "tradable" in raw_data:
+            tradable_f = torch.nan_to_num(raw_data["tradable"].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            tradable_f = torch.ones_like(has_return_f)
         signal = torch.tanh(factors)
-        position = self._build_position(signal, valid_f)
-        turnover = self._compute_turnover(position, valid_f)
+        desired_position = self._build_position(signal)
+        position = self._apply_execution_constraints(desired_position, tradable_f, raw_data)
+        turnover = self._compute_turnover(position, tradable_f)
         pnl = self._compute_pnl(
             position=position,
             turnover=turnover,
             target_ret=target_ret,
             raw_data=raw_data,
-            valid_f=valid_f,
+            has_return_f=has_return_f,
         )
-        return TradingPath(valid=valid, valid_f=valid_f, position=position, turnover=turnover, pnl=pnl)
+        return TradingPath(
+            valid=valid,
+            valid_f=has_return_f,
+            tradable_f=tradable_f,
+            position=position,
+            turnover=turnover,
+            pnl=pnl,
+        )
 
     def _compute_score(self, path: TradingPath) -> tuple[torch.Tensor, float]:
         valid = path.valid

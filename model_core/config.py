@@ -31,6 +31,16 @@ class ModelConfig:
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
     CN_EXIT_TIME = os.getenv("CN_EXIT_TIME", "15:00")
+    # Execution rule controls:
+    # - CN_ENFORCE_T_PLUS_ONE=1 applies same-day sell blocking by default.
+    # - CN_T0_ALLOWED_CODES can whitelist symbols that are allowed to sell intraday.
+    CN_ENFORCE_T_PLUS_ONE = os.getenv("CN_ENFORCE_T_PLUS_ONE", "1") == "1"
+    _CN_T0_ALLOWED_CODES_RAW = os.getenv("CN_T0_ALLOWED_CODES", "")
+    CN_T0_ALLOWED_CODES = [c.strip() for c in _CN_T0_ALLOWED_CODES_RAW.split(",") if c.strip()]
+    # Decision frequency:
+    # - daily: aggregate minute data to one bar per day.
+    # - 1min: keep minute bars as the decision timeline.
+    CN_DECISION_FREQ = os.getenv("CN_DECISION_FREQ", "daily").strip().lower()
     # Bar/return semantics:
     # - CN_BAR_STYLE=daily         -> full-session OHLCV bars.
     # - CN_BAR_STYLE=signal_snapshot -> legacy single-minute snapshot bars.
@@ -39,6 +49,7 @@ class ModelConfig:
     # - CN_TARGET_RET_MODE=signal_to_exit -> legacy same-day signal_time->exit_time return.
     CN_TARGET_RET_MODE = os.getenv("CN_TARGET_RET_MODE", "close_to_close").strip().lower()
     CN_HOLD_DAYS = int(os.getenv("CN_HOLD_DAYS", "1"))
+    CN_HOLD_BARS = int(os.getenv("CN_HOLD_BARS", "1"))
     CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
