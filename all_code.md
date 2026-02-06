@@ -666,7 +666,8 @@ class AlphaGPT(nn.Module):
         self.ops_list = [cfg[0] for cfg in OPS_CONFIG]
         
         self.vocab = self.features_list + self.ops_list
-        self.vocab_size = len(self.vocab)
+        self.bos_id = len(self.vocab)
+        self.vocab_size = len(self.vocab) + 1
         
         # Embedding
         self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
@@ -710,7 +711,7 @@ class AlphaGPT(nn.Module):
         mask = nn.Transformer.generate_square_subsequent_mask(T).to(idx.device)
         
         # Process through looped transformer
-        x = self.blocks(x, mask=mask, is_causal=True)
+        x = self.blocks(x, mask=mask)
         x = self.ln_f(x)
         
         # Use the representation of the *last* token to predict the next token
@@ -1408,6 +1409,7 @@ class AlphaEngine:
         self.bt = ChinaBacktest()
         self.feat_offset = self.vm.feat_offset
         self.vocab_size = self.model.vocab_size
+        self.bos_id = self.model.bos_id
         self.token_arity = self._build_token_arity().to(ModelConfig.DEVICE)
         self.token_delta = self._build_token_delta().to(ModelConfig.DEVICE)
 
@@ -1460,6 +1462,7 @@ class AlphaEngine:
             legal = legal & (next_depth <= remaining_steps)
         else:
             legal = legal & (next_depth == 1)
+        legal[:, self.bos_id] = False
         return legal
 
     def train(self) -> None:
@@ -1483,16 +1486,18 @@ class AlphaEngine:
 
         for step in pbar:
             bs = ModelConfig.BATCH_SIZE
-            inp = torch.zeros((bs, 1), dtype=torch.long, device=ModelConfig.DEVICE)
+            inp = torch.full((bs, 1), self.bos_id, dtype=torch.long, device=ModelConfig.DEVICE)
             stack_depth = torch.zeros(bs, dtype=torch.long, device=ModelConfig.DEVICE)
 
             old_log_probs: list[torch.Tensor] = []
+            old_values_steps: list[torch.Tensor] = []
             tokens_list: list[torch.Tensor] = []
             stack_depth_steps: list[torch.Tensor] = []
 
             for t in range(ModelConfig.MAX_FORMULA_LEN):
-                logits, _, _ = self.model(inp)
+                logits, value_t, _ = self.model(inp)
                 stack_depth_steps.append(stack_depth.clone())
+                old_values_steps.append(value_t.squeeze(-1).detach())
                 remaining_steps = ModelConfig.MAX_FORMULA_LEN - t
                 legal_mask = self._legal_action_mask(stack_depth, remaining_steps)
                 masked_logits = logits.masked_fill(~legal_mask, -1e9)
@@ -1507,10 +1512,7 @@ class AlphaEngine:
             seqs = torch.stack(tokens_list, dim=1)
             rollout_inputs = inp.detach()
             old_log_probs_tensor = torch.stack(old_log_probs, dim=1).detach()
-
-            with torch.no_grad():
-                _, old_values, _ = self.model(rollout_inputs)
-                old_values = old_values.squeeze(-1).detach()
+            old_values = torch.stack(old_values_steps, dim=1)
 
             rewards = torch.zeros(bs, device=ModelConfig.DEVICE)
             val_scores: list[float] = []
@@ -1584,8 +1586,10 @@ class AlphaEngine:
                     tqdm.write(f"[!] New King: Score {selection_score:.2f} | Ret {ret_val:.2%} | Formula {formula}")
 
             returns = torch.nan_to_num(rewards.detach(), nan=-2.0, posinf=5.0, neginf=-5.0)
-            advantages = returns - old_values
+            returns_steps = returns.unsqueeze(1).expand(-1, ModelConfig.MAX_FORMULA_LEN)
+            advantages = returns_steps - old_values
             advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-5)
+            advantages = advantages.detach()
 
             policy_loss_value = float("nan")
             value_loss_value = float("nan")
@@ -1593,34 +1597,34 @@ class AlphaEngine:
 
             for _ in range(max(1, ModelConfig.PPO_EPOCHS)):
                 new_log_probs_steps: list[torch.Tensor] = []
+                values_pred_steps: list[torch.Tensor] = []
                 entropy_steps: list[torch.Tensor] = []
 
                 for t in range(ModelConfig.MAX_FORMULA_LEN):
                     prefix = rollout_inputs[:, : t + 1]
-                    logits_t, _, _ = self.model(prefix)
+                    logits_t, value_t, _ = self.model(prefix)
                     remaining_steps = ModelConfig.MAX_FORMULA_LEN - t
                     legal_mask_t = self._legal_action_mask(stack_depth_steps[t], remaining_steps)
                     masked_logits_t = logits_t.masked_fill(~legal_mask_t, -1e9)
                     dist_t = Categorical(logits=masked_logits_t)
                     actions_t = seqs[:, t]
                     new_log_probs_steps.append(dist_t.log_prob(actions_t))
+                    values_pred_steps.append(value_t.squeeze(-1))
                     entropy_steps.append(dist_t.entropy())
 
                 new_log_probs = torch.stack(new_log_probs_steps, dim=1)
                 ratio = torch.exp(new_log_probs - old_log_probs_tensor)
 
-                adv_expand = advantages.unsqueeze(1)
-                surr1 = ratio * adv_expand
+                surr1 = ratio * advantages
                 surr2 = torch.clamp(
                     ratio,
                     1.0 - ModelConfig.PPO_CLIP_EPS,
                     1.0 + ModelConfig.PPO_CLIP_EPS,
-                ) * adv_expand
+                ) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                _, values_pred, _ = self.model(rollout_inputs)
-                values_pred = values_pred.squeeze(-1)
-                value_loss = F.mse_loss(values_pred, returns)
+                values_pred = torch.stack(values_pred_steps, dim=1)
+                value_loss = F.mse_loss(values_pred, returns_steps)
 
                 entropy_bonus = torch.stack(entropy_steps, dim=1).mean()
                 loss = (
@@ -1761,11 +1765,10 @@ class FeatureEngineer:
     @staticmethod
     def robust_norm(t: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
         """Robust Z-Score Normalization (Cross-Sectional or Time-Series)."""
-        # Here we normalize across time per asset (Time-Series Z-Score) as per original logic,
-        # but robust to outliers using Median and MAD.
-        # t: [Batch, Time]
-        median = torch.nanmedian(t, dim=1, keepdim=True)[0]
-        mad = torch.nanmedian(torch.abs(t - median), dim=1, keepdim=True)[0] + 1e-6
+        # Normalize along the last axis (time axis).
+        # Works for both [Batch, Time] and [Asset, Feature, Time].
+        median = torch.nanmedian(t, dim=-1, keepdim=True)[0]
+        mad = torch.nanmedian(torch.abs(t - median), dim=-1, keepdim=True)[0] + 1e-6
         norm = (t - median) / mad
         return torch.clamp(norm, -clip, clip)
 
@@ -2451,6 +2454,7 @@ unify_data.py
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 from pathlib import Path
 from typing import Iterable, Optional
@@ -2477,11 +2481,21 @@ def read_last_line(path: Path) -> str:
             offset = min(size, offset * 2)
 
 
-def get_last_token(path: Path, expect_time: bool) -> Optional[str]:
+def get_last_token(path: Path, expect_time: bool, time_col: str) -> Optional[str]:
+    if not path.exists():
+        return None
     line = read_last_line(path)
     if not line:
         return None
-    token = line.split(",", 1)[0].strip()
+    col_idx = 0
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+        header = next(csv.reader(handle), None)
+        if header and time_col in header:
+            col_idx = header.index(time_col)
+    row = next(csv.reader([line]), [])
+    if col_idx >= len(row):
+        return None
+    token = row[col_idx].strip()
     if expect_time:
         if len(token) >= 10 and token[:4].isdigit():
             return token
@@ -2516,7 +2530,7 @@ def append_group(
     group = group.dropna(subset=[time_col])
     group = group.drop_duplicates(subset=[time_col], keep="last")
 
-    last_token = get_last_token(output_path, expect_time=expect_time)
+    last_token = get_last_token(output_path, expect_time=expect_time, time_col=time_col)
     if last_token:
         group = group[group[time_col] > last_token]
 
