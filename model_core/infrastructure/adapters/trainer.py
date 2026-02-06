@@ -70,5 +70,5 @@ class LegacyAlphaTrainer:
         return TrainingArtifact(
             best_formula=result.best_formula,
             best_score=float(result.best_score),
-            strategy_path=ModelConfig.STRATEGY_FILE,
+            strategy_path=ModelConfig.STRATEGY_FILE if result.best_formula is not None else None,
         )

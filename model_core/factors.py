@@ -3,22 +3,22 @@ import pandas as pd
 from typing import Optional
 
 try:
-    import pandas_ta as ta
-    if not hasattr(ta, "Strategy"):
-        raise ImportError("pandas_ta package does not provide Strategy API")
+    import pandas_ta_classic as ta
 except ImportError:
     try:
-        import pandas_ta_classic as ta
+        import pandas_ta as ta
+        if not hasattr(ta, "Strategy"):
+            raise ImportError("pandas_ta package does not provide Strategy API")
     except ImportError as exc:
         raise ImportError(
             "pandas_ta Strategy API is required for feature generation. "
-            "Install with `pip install pandas-ta-classic` or a compatible pandas_ta build."
+            "Install with `pip install pandas-ta-classic`."
         ) from exc
 
 class FeatureEngineer:
     """Feature engineer for China A-share/ETF data using pandas_ta."""
     
-    # 58 Features
+    # 61 Features
     FEATURES = [
         # Price Transform
         'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME', 'AMOUNT',
@@ -181,7 +181,6 @@ class FeatureEngineer:
                 {"kind": "ad"},
                 {"kind": "adosc"},
                 {"kind": "cmf"},
-                {"kind": "mfi", "length": 14},
             ]
         )
         
@@ -198,7 +197,11 @@ class FeatureEngineer:
             df['volume'] = df['volume'].replace(0, 1e-4)
             
             # Run Strategy
-            df.ta.strategy(CustomStrategy)
+            ta_accessor = df.ta
+            if hasattr(ta_accessor, "cores"):
+                # Avoid multiprocessing path instability across pandas-ta variants.
+                ta_accessor.cores = 0
+            ta_accessor.strategy(CustomStrategy)
             
             # --- Map implementation output columns to FEATURES list ---
             # pandas_ta auto-names columns like "RSI_14", "MACD_12_26_9", etc.
@@ -318,7 +321,8 @@ class FeatureEngineer:
                     pass 
                 else:
                     # Fill
-                    feat_out[i, f_idx, :] = torch.from_numpy(val).to(device)
+                    val_np = val.copy() if hasattr(val, "copy") else val
+                    feat_out[i, f_idx, :] = torch.as_tensor(val_np, dtype=dtype, device=device)
 
         # Post-process: NaN handling & Normalization
         feat_out = torch.nan_to_num(feat_out, nan=0.0, posinf=0.0, neginf=0.0)

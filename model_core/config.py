@@ -9,7 +9,7 @@ class ModelConfig:
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1024"))
     TRAIN_STEPS = int(os.getenv("TRAIN_STEPS", "400"))
     MAX_FORMULA_LEN = int(os.getenv("MAX_FORMULA_LEN", "8"))
-    INPUT_DIM = 58  # Updated for pandas_ta features
+    INPUT_DIM = 61  # Keep in sync with FeatureEngineer.FEATURES
     PPO_EPOCHS = int(os.getenv("PPO_EPOCHS", "4"))
     PPO_CLIP_EPS = float(os.getenv("PPO_CLIP_EPS", "0.2"))
     PPO_VALUE_COEF = float(os.getenv("PPO_VALUE_COEF", "0.5"))
@@ -34,7 +34,7 @@ class ModelConfig:
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
     CN_EXIT_TIME = os.getenv("CN_EXIT_TIME", "15:00")
     CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
-    CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "7"))
+    CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
     CN_VAL_RATIO = float(os.getenv("CN_VAL_RATIO", "0.15"))
     CN_TEST_RATIO = float(os.getenv("CN_TEST_RATIO", "0.15"))

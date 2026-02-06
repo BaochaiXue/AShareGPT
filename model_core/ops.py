@@ -35,6 +35,26 @@ def _ts_decay_linear(x: torch.Tensor, d: int) -> torch.Tensor:
     w = w / w.sum()
     return (windows * w).sum(dim=-1)
 
+@torch.jit.script
+def _ts_std(x: torch.Tensor, d: int) -> torch.Tensor:
+    if d <= 1:
+        return torch.zeros_like(x)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    x_pad = torch.cat([pad, x], dim=1)
+    windows = x_pad.unfold(1, d, 1)
+    return windows.std(dim=-1, unbiased=False)
+
+@torch.jit.script
+def _ts_rank(x: torch.Tensor, d: int) -> torch.Tensor:
+    if d <= 1:
+        return torch.zeros_like(x)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    x_pad = torch.cat([pad, x], dim=1)
+    windows = x_pad.unfold(1, d, 1)
+    last = windows[:, :, -1].unsqueeze(-1)
+    less_equal = (windows <= last).to(x.dtype).sum(dim=-1)
+    return (less_equal - 1.0) / float(d - 1)
+
 OPS_CONFIG: list[tuple[str, Callable[..., torch.Tensor], int]] = [
     ('ADD', lambda x, y: x + y, 2),
     ('SUB', lambda x, y: x - y, 2),
@@ -45,6 +65,6 @@ OPS_CONFIG: list[tuple[str, Callable[..., torch.Tensor], int]] = [
     ('SIGN', torch.sign, 1),
     ('DELTA5', lambda x: _ts_delta(x, 5), 1),
     ('MA20', lambda x: _ts_decay_linear(x, 20), 1),
-    ('STD20', lambda x: _ts_zscore(x, 20), 1),
-    ('TS_RANK20', lambda x: _ts_zscore(x, 20), 1),
+    ('STD20', lambda x: _ts_std(x, 20), 1),
+    ('TS_RANK20', lambda x: _ts_rank(x, 20), 1),
 ]

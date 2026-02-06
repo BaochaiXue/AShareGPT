@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
@@ -162,8 +163,12 @@ class TrainingWorkflowService:
             on_new_best=on_new_best,
         )
 
-        with open(strategy_path, "w", encoding="utf-8") as handle:
-            json.dump(run_state.best_formula, handle)
+        strategy_file = Path(strategy_path)
+        if run_state.best_formula is not None:
+            with strategy_file.open("w", encoding="utf-8") as handle:
+                json.dump(run_state.best_formula, handle)
+        elif strategy_file.exists():
+            strategy_file.unlink()
         with open(history_path, "w", encoding="utf-8") as handle:
             json.dump(run_state.history, handle)
 
