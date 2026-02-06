@@ -44,7 +44,7 @@ class LegacyAlphaTrainer:
         )
         if self._workflow.use_lord:
             print("   LoRD Regularization enabled")
-            print("   Target keywords: ['q_proj', 'k_proj', 'attention', 'qk_norm']")
+            print("   Target keywords: ['q_proj', 'k_proj', 'attention']")
         for line in self._workflow.train_window_descriptions():
             print(line)
 

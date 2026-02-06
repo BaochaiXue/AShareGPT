@@ -34,7 +34,7 @@ class NewtonSchulzLowRankDecay:
                  target_keywords: Optional[list[str]] = None):
         self.decay_rate = decay_rate
         self.num_iterations = num_iterations
-        self.target_keywords = target_keywords or ["qk_norm", "attention"]
+        self.target_keywords = target_keywords or ["attention"]
         self.params_to_decay: list[tuple[str, nn.Parameter]] = []
         
         for name, param in named_parameters:
@@ -128,26 +128,6 @@ class RMSNorm(nn.Module):
         return (x / rms) * self.weight
 
 
-class QKNorm(nn.Module):
-    """
-    Query-Key Normalization for Attention.
-    Propounded to stabilize training of large Transformers by normalizing Q and K
-    before the dot product. This prevents attention scores from growing too large.
-    """
-    
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.scale = nn.Parameter(torch.ones(1, 1, 1, d_model) * (d_model ** -0.5))
-    
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Normalize Q and K independently along the head dimension
-        # q, k: [Batch, Head, SeqLen, HeadDim]
-        q_norm = F.normalize(q, p=2, dim=-1)
-        k_norm = F.normalize(k, p=2, dim=-1)
-        return q_norm * self.scale, k_norm * self.scale
-
-
 class SwiGLU(nn.Module):
     """Swish Gated Linear Unit (SwiGLU) activation function."""
     
@@ -219,10 +199,7 @@ class LoopedTransformerLayer(nn.Module):
         self.num_loops = num_loops
         self.d_model = d_model
         self.nhead = nhead
-        
-        # QK-Norm attention to stabilize training with high recurrence
-        self.qk_norm = QKNorm(d_model // nhead)
-        
+
         # Standard attention components
         self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         
@@ -242,9 +219,6 @@ class LoopedTransformerLayer(nn.Module):
         for _ in range(self.num_loops):
             # Self-attention with residual (Pre-Norm architecture)
             x_norm = self.norm1(x)
-            # Note: We should ideally plug QKNorm here if not using torch's native MHA, 
-            # but torch's MHA encapsulates dot product. QKNorm requires custom attention impl.
-            # Assuming MHA here for simplicity, but in full implementation we'd unpack MHA.
             attn_out, _ = self.attention(x_norm, x_norm, x_norm, attn_mask=mask, is_causal=is_causal)
             x = x + self.dropout(attn_out)
             

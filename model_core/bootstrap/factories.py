@@ -62,7 +62,7 @@ def create_training_workflow_service_from_components(
             model.named_parameters(),
             decay_rate=lord_decay_rate,
             num_iterations=lord_num_iterations,
-            target_keywords=["q_proj", "k_proj", "attention", "qk_norm"],
+            target_keywords=["q_proj", "k_proj", "attention"],
         )
         rank_monitor = StableRankMonitor(
             model,
