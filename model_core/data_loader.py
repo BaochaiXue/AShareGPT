@@ -332,111 +332,134 @@ class ChinaMinuteDataLoader:
             start += step_len
         return folds
 
-    def load_data(
+    def _resolve_time_bounds(
         self,
-        codes: Optional[list[str]] = None,
-        years: Optional[list[int]] = None,
-        start_date: str = "",
-        end_date: str = "",
-        signal_time: str = "",
-        exit_time: str = "",
-        limit_codes: int = 50,
-    ) -> None:
-        years = self._resolve_years(years)
-        if not years:
-            raise ValueError("No available year folders for minute data.")
-
-        codes = self._resolve_codes(codes, years, limit_codes)
-        if not codes:
-            raise ValueError("No codes resolved for minute data.")
-
-        sig_time = self._parse_time(signal_time or ModelConfig.CN_SIGNAL_TIME) or time(10, 0)
-        exit_t = self._parse_time(exit_time or ModelConfig.CN_EXIT_TIME)
-
+        start_date: str,
+        end_date: str,
+    ) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], Optional[pd.Timestamp]]:
         start_raw = start_date or ModelConfig.CN_MINUTE_START_DATE
         end_raw = end_date or ModelConfig.CN_MINUTE_END_DATE
         start_dt = pd.to_datetime(start_raw) if start_raw else None
         end_dt = pd.to_datetime(end_raw) if end_raw else None
-        end_dt_exclusive = None
+        end_dt_exclusive: Optional[pd.Timestamp] = None
         if end_dt is not None and self._is_date_only_literal(end_raw):
             end_dt_exclusive = end_dt.normalize() + pd.Timedelta(days=1)
+        return start_dt, end_dt, end_dt_exclusive
 
-        per_code_frames: dict[str, pd.DataFrame] = {}
+    def _load_daily_records_for_code(
+        self,
+        *,
+        code: str,
+        years: list[int],
+        start_dt: Optional[pd.Timestamp],
+        end_dt: Optional[pd.Timestamp],
+        end_dt_exclusive: Optional[pd.Timestamp],
+        sig_time: time,
+        exit_t: Optional[time],
+    ) -> list[dict[str, float | pd.Timestamp]]:
+        records: list[dict[str, float | pd.Timestamp]] = []
+        for year in years:
+            path = self.data_root / str(year) / f"{code}.csv"
+            if not path.exists():
+                continue
+            df = pd.read_csv(
+                path,
+                usecols=["trade_time", "open", "high", "low", "close", "vol", "amount"],
+                dtype={"trade_time": "string"},
+            )
+            if df.empty:
+                continue
+            df["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
+            df = df.dropna(subset=["trade_time"])
+            if start_dt is not None:
+                df = df[df["trade_time"] >= start_dt]
+            if end_dt_exclusive is not None:
+                # Date-only end bounds are inclusive of the whole end day.
+                df = df[df["trade_time"] < end_dt_exclusive]
+            elif end_dt is not None:
+                df = df[df["trade_time"] <= end_dt]
+            if df.empty:
+                continue
+            df["date"] = df["trade_time"].dt.normalize()
 
-        for code in codes:
-            records = []
-            for year in years:
-                path = self.data_root / str(year) / f"{code}.csv"
-                if not path.exists():
+            for date, day_frame in df.groupby("date"):
+                day_frame = day_frame.sort_values("trade_time")
+                time_series = day_frame["trade_time"].dt.time
+                entry_candidates = day_frame[time_series >= sig_time]
+                entry_row = entry_candidates.iloc[0] if not entry_candidates.empty else day_frame.iloc[0]
+
+                if exit_t:
+                    exit_candidates = day_frame[time_series >= exit_t]
+                    exit_row = exit_candidates.iloc[0] if not exit_candidates.empty else day_frame.iloc[-1]
+                else:
+                    exit_row = day_frame.iloc[-1]
+
+                entry_open = float(entry_row["open"])
+                exit_close = float(exit_row["close"])
+                if entry_open == 0:
                     continue
-                df = pd.read_csv(
-                    path,
-                    usecols=["trade_time", "open", "high", "low", "close", "vol", "amount"],
-                    dtype={"trade_time": "string"},
+
+                records.append(
+                    {
+                        "date": date,
+                        "open": float(entry_row["open"]),
+                        "high": float(entry_row["high"]),
+                        "low": float(entry_row["low"]),
+                        "close": float(entry_row["close"]),
+                        "volume": float(entry_row["vol"]),
+                        "amount": float(entry_row["amount"]),
+                        "target_ret": (exit_close / entry_open) - 1.0,
+                    }
                 )
-                if df.empty:
-                    continue
-                df["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
-                df = df.dropna(subset=["trade_time"])
-                if start_dt is not None:
-                    df = df[df["trade_time"] >= start_dt]
-                if end_dt_exclusive is not None:
-                    # Date-only end bounds are inclusive of the whole end day.
-                    df = df[df["trade_time"] < end_dt_exclusive]
-                elif end_dt is not None:
-                    df = df[df["trade_time"] <= end_dt]
-                if df.empty:
-                    continue
-                df["date"] = df["trade_time"].dt.normalize()
+        return records
 
-                for date, g in df.groupby("date"):
-                    g = g.sort_values("trade_time")
-                    time_series = g["trade_time"].dt.time
-                    entry_candidates = g[time_series >= sig_time]
-                    entry_row = entry_candidates.iloc[0] if not entry_candidates.empty else g.iloc[0]
+    def _build_per_code_frames(
+        self,
+        *,
+        codes: list[str],
+        years: list[int],
+        start_dt: Optional[pd.Timestamp],
+        end_dt: Optional[pd.Timestamp],
+        end_dt_exclusive: Optional[pd.Timestamp],
+        sig_time: time,
+        exit_t: Optional[time],
+    ) -> dict[str, pd.DataFrame]:
+        per_code_frames: dict[str, pd.DataFrame] = {}
+        for code in codes:
+            records = self._load_daily_records_for_code(
+                code=code,
+                years=years,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                end_dt_exclusive=end_dt_exclusive,
+                sig_time=sig_time,
+                exit_t=exit_t,
+            )
+            if not records:
+                continue
+            frame = pd.DataFrame(records)
+            frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+            if ModelConfig.CN_USE_ADJ_FACTOR:
+                frame = self._apply_adj_factors(code, frame)
+            per_code_frames[code] = frame
+        return per_code_frames
 
-                    if exit_t:
-                        exit_candidates = g[time_series >= exit_t]
-                        exit_row = exit_candidates.iloc[0] if not exit_candidates.empty else g.iloc[-1]
-                    else:
-                        exit_row = g.iloc[-1]
+    def _apply_recent_day_cutoff(
+        self,
+        per_code_frames: dict[str, pd.DataFrame],
+        *,
+        end_dt: Optional[pd.Timestamp],
+    ) -> None:
+        if end_dt is not None or not ModelConfig.CN_MINUTE_DAYS:
+            return
+        cutoff_days = ModelConfig.CN_MINUTE_DAYS
+        for code, frame in list(per_code_frames.items()):
+            frame = frame.sort_values("date")
+            if len(frame) > cutoff_days:
+                frame = frame.iloc[-cutoff_days:]
+            per_code_frames[code] = frame
 
-                    entry_open = float(entry_row["open"])
-                    exit_close = float(exit_row["close"])
-                    if entry_open == 0:
-                        continue
-
-                    records.append(
-                        {
-                            "date": date,
-                            "open": float(entry_row["open"]),
-                            "high": float(entry_row["high"]),
-                            "low": float(entry_row["low"]),
-                            "close": float(entry_row["close"]),
-                            "volume": float(entry_row["vol"]),
-                            "amount": float(entry_row["amount"]),
-                            "target_ret": (exit_close / entry_open) - 1.0,
-                        }
-                    )
-
-            if records:
-                frame = pd.DataFrame(records)
-                frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
-                if ModelConfig.CN_USE_ADJ_FACTOR:
-                    frame = self._apply_adj_factors(code, frame)
-                per_code_frames[code] = frame
-
-        if not per_code_frames:
-            raise ValueError("No minute data loaded. Check codes/years/date filters.")
-
-        if end_dt is None and ModelConfig.CN_MINUTE_DAYS:
-            cutoff_days = ModelConfig.CN_MINUTE_DAYS
-            for code, frame in list(per_code_frames.items()):
-                frame = frame.sort_values("date")
-                if len(frame) > cutoff_days:
-                    frame = frame.iloc[-cutoff_days:]
-                per_code_frames[code] = frame
-
+    def _build_pivots(self, per_code_frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         def build_pivot(
             field: str,
             *,
@@ -463,37 +486,98 @@ class ChinaMinuteDataLoader:
             "amount": (False, 0.0),
             "target_ret": (False, None),
         }
-        pivots: dict[str, pd.DataFrame] = {
+        pivots = {
             field: build_pivot(field, ffill=ffill, fill_value=fill_value)
             for field, (ffill, fill_value) in pivot_specs.items()
         }
         if ModelConfig.CN_USE_ADJ_FACTOR:
             pivots["adj_factor"] = build_pivot("adj_factor", ffill=True, fill_value=1.0)
+        return pivots
+
+    @staticmethod
+    def _pivot_to_tensor(
+        pivot: pd.DataFrame,
+        *,
+        index: pd.DatetimeIndex,
+        columns: pd.Index,
+    ) -> torch.Tensor:
+        aligned = pivot.reindex(index=index, columns=columns)
+        return torch.tensor(aligned.values.T, dtype=torch.float32, device=ModelConfig.DEVICE)
+
+    def _build_tensors_from_pivots(
+        self,
+        pivots: dict[str, pd.DataFrame],
+        *,
+        index: pd.DatetimeIndex,
+        columns: pd.Index,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        target_tensor = self._pivot_to_tensor(pivots["target_ret"], index=index, columns=columns)
+        self._validate_target_ret_mask(pivots["target_ret"], target_tensor)
+
+        raw_data_cache = {
+            "open": self._pivot_to_tensor(pivots["open"], index=index, columns=columns),
+            "high": self._pivot_to_tensor(pivots["high"], index=index, columns=columns),
+            "low": self._pivot_to_tensor(pivots["low"], index=index, columns=columns),
+            "close": self._pivot_to_tensor(pivots["close"], index=index, columns=columns),
+            "volume": self._pivot_to_tensor(pivots["volume"], index=index, columns=columns),
+            "amount": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
+            "liquidity": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
+            "fdv": self._pivot_to_tensor(pivots["amount"], index=index, columns=columns),
+        }
+        if "adj_factor" in pivots:
+            raw_data_cache["adj_factor"] = self._pivot_to_tensor(
+                pivots["adj_factor"],
+                index=index,
+                columns=columns,
+            )
+        return raw_data_cache, target_tensor
+
+    def load_data(
+        self,
+        codes: Optional[list[str]] = None,
+        years: Optional[list[int]] = None,
+        start_date: str = "",
+        end_date: str = "",
+        signal_time: str = "",
+        exit_time: str = "",
+        limit_codes: int = 50,
+    ) -> None:
+        years = self._resolve_years(years)
+        if not years:
+            raise ValueError("No available year folders for minute data.")
+
+        codes = self._resolve_codes(codes, years, limit_codes)
+        if not codes:
+            raise ValueError("No codes resolved for minute data.")
+
+        sig_time = self._parse_time(signal_time or ModelConfig.CN_SIGNAL_TIME) or time(10, 0)
+        exit_t = self._parse_time(exit_time or ModelConfig.CN_EXIT_TIME)
+        start_dt, end_dt, end_dt_exclusive = self._resolve_time_bounds(start_date, end_date)
+        per_code_frames = self._build_per_code_frames(
+            codes=codes,
+            years=years,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            end_dt_exclusive=end_dt_exclusive,
+            sig_time=sig_time,
+            exit_t=exit_t,
+        )
+
+        if not per_code_frames:
+            raise ValueError("No minute data loaded. Check codes/years/date filters.")
+
+        self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt)
+        pivots = self._build_pivots(per_code_frames)
 
         index = pivots["close"].index
         columns = pivots["close"].columns
         train_len, val_len, test_len = self._resolve_split_sizes(len(index))
         self._validate_split_order(index, train_len, val_len, test_len)
-
-        def to_tensor(pivot: pd.DataFrame) -> torch.Tensor:
-            pivot = pivot.reindex(index=index, columns=columns)
-            return torch.tensor(pivot.values.T, dtype=torch.float32, device=ModelConfig.DEVICE)
-
-        target_tensor = to_tensor(pivots["target_ret"])
-        self._validate_target_ret_mask(pivots["target_ret"], target_tensor)
-
-        self.raw_data_cache = {
-            "open": to_tensor(pivots["open"]),
-            "high": to_tensor(pivots["high"]),
-            "low": to_tensor(pivots["low"]),
-            "close": to_tensor(pivots["close"]),
-            "volume": to_tensor(pivots["volume"]),
-            "amount": to_tensor(pivots["amount"]),
-            "liquidity": to_tensor(pivots["amount"]),
-            "fdv": to_tensor(pivots["amount"]),
-        }
-        if "adj_factor" in pivots:
-            self.raw_data_cache["adj_factor"] = to_tensor(pivots["adj_factor"])
+        self.raw_data_cache, target_tensor = self._build_tensors_from_pivots(
+            pivots,
+            index=index,
+            columns=columns,
+        )
 
         raw_feat = FeatureEngineer.compute_features(
             self.raw_data_cache,
