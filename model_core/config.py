@@ -48,6 +48,7 @@ class ModelConfig:
     CN_WFO_STEP_DAYS = int(os.getenv("CN_WFO_STEP_DAYS", "20"))
     CN_FEATURE_NORM = os.getenv("CN_FEATURE_NORM", "train").strip().lower()
     CN_FEATURE_CLIP = float(os.getenv("CN_FEATURE_CLIP", "5.0"))
+    CN_REWARD_MODE = os.getenv("CN_REWARD_MODE", "selection").strip().lower()
     CN_STRICT_FEATURE_INDICATORS = os.getenv("CN_STRICT_FEATURE_INDICATORS", "1") == "1"
     CN_FEATURE_NEAR_ZERO_STD_TOL = float(os.getenv("CN_FEATURE_NEAR_ZERO_STD_TOL", "1e-6"))
     _CN_CODES_RAW = os.getenv("CN_CODES", "")

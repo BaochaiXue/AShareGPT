@@ -15,6 +15,7 @@ class FormulaEvaluation:
     reward: float
     selection_score: Optional[float]
     mean_return: float
+    train_score: Optional[float] = None
     val_score: Optional[float] = None
 
 
@@ -35,6 +36,7 @@ class FormulaRewardOrchestrator:
         val_slice: Optional[DataSlice],
         walk_forward_folds: list[WalkForwardFold],
         use_wfo: bool,
+        reward_mode: str = "selection",
     ):
         self._vm = vm
         self._backtest_engine = backtest_engine
@@ -42,6 +44,10 @@ class FormulaRewardOrchestrator:
         self._val_slice = val_slice
         self._walk_forward_folds = walk_forward_folds
         self._use_wfo = use_wfo
+        mode = reward_mode.strip().lower()
+        if mode not in {"train", "selection"}:
+            raise ValueError(f"Unsupported reward_mode={reward_mode!r}; expected 'train' or 'selection'.")
+        self._reward_mode = mode
 
     @torch.no_grad()
     def evaluate_formula(self, formula: list[int], full_feat: torch.Tensor) -> FormulaEvaluation:
@@ -81,6 +87,8 @@ class FormulaRewardOrchestrator:
             reward=reward,
             selection_score=reward,
             mean_return=mean_return,
+            train_score=None,
+            val_score=reward,
         )
 
     def _evaluate_train_val(self, res: torch.Tensor) -> FormulaEvaluation:
@@ -93,8 +101,8 @@ class FormulaRewardOrchestrator:
             self._train_slice.raw_data_cache,
             self._train_slice.target_ret,
         )
-        reward = float(train_result.score.item())
-        selection_score = reward
+        train_score = float(train_result.score.item())
+        selection_score = train_score
         mean_return = float(train_result.mean_return)
         val_score: Optional[float] = None
 
@@ -110,10 +118,12 @@ class FormulaRewardOrchestrator:
                 mean_return = float(val_result.mean_return)
                 val_score = selection_score
 
+        reward = train_score if self._reward_mode == "train" else selection_score
+
         return FormulaEvaluation(
             reward=reward,
             selection_score=selection_score,
             mean_return=mean_return,
+            train_score=train_score,
             val_score=val_score,
         )
-

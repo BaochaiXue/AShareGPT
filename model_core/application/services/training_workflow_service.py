@@ -135,6 +135,7 @@ class TrainingWorkflowService:
             val_slice=self.val_slice,
             walk_forward_folds=self.walk_forward_folds,
             use_wfo=self.use_wfo,
+            reward_mode=ModelConfig.CN_REWARD_MODE,
         )
         ppo_service = PpoTrainingService(
             model=self.model,

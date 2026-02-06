@@ -78,6 +78,7 @@ class PpoTrainingService:
             "avg_reward": [],
             "best_score": [],
             "stable_rank": [],
+            "avg_train_score": [],
             "avg_val_score": [],
             "policy_loss": [],
             "value_loss": [],
@@ -89,7 +90,7 @@ class PpoTrainingService:
         pbar = tqdm(range(train_steps))
         for step in pbar:
             rollout = self._sample_rollout(batch_size=batch_size, max_formula_len=max_formula_len)
-            rewards, val_scores, best_score, best_formula = self._evaluate_batch(
+            rewards, train_scores, val_scores, best_score, best_formula = self._evaluate_batch(
                 seqs=rollout.seqs,
                 full_feat=full_feat,
                 best_score=best_score,
@@ -126,6 +127,13 @@ class PpoTrainingService:
                 stable_rank = float(rank_monitor.compute())
                 postfix["Rank"] = f"{stable_rank:.2f}"
                 history["stable_rank"].append(stable_rank)
+
+            if train_scores:
+                avg_train = float(sum(train_scores) / len(train_scores))
+                postfix["Train"] = f"{avg_train:.3f}"
+                history["avg_train_score"].append(avg_train)
+            else:
+                history["avg_train_score"].append(float("nan"))
 
             if val_scores:
                 avg_val = float(sum(val_scores) / len(val_scores))
@@ -186,15 +194,18 @@ class PpoTrainingService:
         best_score: float,
         best_formula: Optional[list[int]],
         on_new_best: Optional[Callable[[float, float, list[int]], None]],
-    ) -> tuple[torch.Tensor, list[float], float, Optional[list[int]]]:
+    ) -> tuple[torch.Tensor, list[float], list[float], float, Optional[list[int]]]:
         batch_size = seqs.shape[0]
         rewards = torch.zeros(batch_size, device=self.device)
+        train_scores: list[float] = []
         val_scores: list[float] = []
 
         for i in range(batch_size):
             formula = seqs[i].tolist()
             eval_out = self.reward_orchestrator.evaluate_formula(formula, full_feat)
             rewards[i] = eval_out.reward
+            if eval_out.train_score is not None:
+                train_scores.append(eval_out.train_score)
             if eval_out.val_score is not None:
                 val_scores.append(eval_out.val_score)
             if eval_out.selection_score is None:
@@ -205,7 +216,7 @@ class PpoTrainingService:
                 if on_new_best:
                     on_new_best(best_score, eval_out.mean_return, formula)
 
-        return rewards, val_scores, best_score, best_formula
+        return rewards, train_scores, val_scores, best_score, best_formula
 
     def _compute_advantages(
         self,
@@ -291,4 +302,3 @@ class PpoTrainingService:
             legal = legal & (next_depth == 1)
         legal[:, self.bos_id] = False
         return legal
-

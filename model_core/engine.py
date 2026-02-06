@@ -73,6 +73,7 @@ class AlphaEngine:
             "avg_reward": [],
             "best_score": [],
             "stable_rank": [],
+            "avg_train_score": [],
             "avg_val_score": [],
             "policy_loss": [],
             "value_loss": [],
