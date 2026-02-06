@@ -25,6 +25,7 @@ DEFAULT_IGNORE_DIRS: tuple[str, ...] = (
     "build",
     "dist",
     "node_modules",
+    "tests",
 )
 
 SUFFIX_TO_LANG: dict[str, str] = {
