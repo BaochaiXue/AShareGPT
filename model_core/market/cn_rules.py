@@ -8,7 +8,8 @@ from model_core.config import ModelConfig
 
 
 def _normalize_code(code: str) -> str:
-    return code.strip().upper()
+    """Normalize to bare code without exchange suffix. '510300.SH' -> '510300'."""
+    return code.strip().upper().split(".")[0]
 
 
 def _limit_pct_for_code(code: str) -> float:
@@ -19,7 +20,7 @@ def _limit_pct_for_code(code: str) -> float:
     科创板(SH 688xxx):            ±20%
     北交所(BJ 8xxxxx/4xxxxx):     ±30%  (simplified)
     """
-    c = _normalize_code(code).split(".")[0]
+    c = _normalize_code(code)
     if c.startswith("300") or c.startswith("688"):
         return 0.20
     if c.startswith("8") or c.startswith("4"):
@@ -37,7 +38,7 @@ class ChinaMarketRules:
 
     enforce_t_plus_one: bool
     t0_allowed_codes: frozenset[str]
-    limit_hit_tol: float  # tolerance for limit detection (e.g. 0.001)
+    limit_hit_tol: float
 
     @classmethod
     def from_config(cls) -> "ChinaMarketRules":
@@ -94,22 +95,14 @@ class ChinaMarketRules:
     ) -> torch.Tensor:
         """Build sell-block matrix.
 
-        For both daily and 1min freq:
-        - daily:  any bar in the same calendar day as a buy cannot sell (effectively
-                  means you can never sell on the same day you buy — whole row is
-                  within one session).  We mark ALL bars that share a session with
-                  their predecessor so that the backtest engine can block sells on
-                  new-buy bars.
-        - 1min:   within-session bars are blocked; cross-session boundary = new day
-                  = can now sell yesterday's position.
+        - daily:  session changes every bar → same_session is all-zero → no
+                  intra-step block.  The backtest loop itself prevents selling
+                  shares bought in the same step via ``locked_buy``.
+        - 1min:   within-session bars are blocked; cross-session = new day.
         """
         block = torch.zeros_like(t_plus_one_required)
         if t_plus_one_required.numel() == 0:
             return block
-        # For daily freq the session_id changes every row, so same_session is
-        # all-zeros.  That is correct: the backtest engine separately enforces
-        # that we cannot sell on the *buy-bar* itself by checking position
-        # changes within the step.
         same_session = (session_ids[:, 1:] == session_ids[:, :-1]).float()
         block[:, 1:] = same_session * t_plus_one_required[:, 1:]
         return block
@@ -118,26 +111,43 @@ class ChinaMarketRules:
     #  Price-limit (涨跌停) matrices
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def compute_prev_day_close(
+        close: torch.Tensor,
+        session_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """For each bar, return the closing price of the *previous* trading day.
+
+        At session boundaries (new day), prev_day_close = close of last bar
+        of the prior session.  Within a session, carry forward.
+        """
+        prev_day = close.clone()
+        prev_day[:, 0] = close[:, 0]  # no prior day → use own close (no limit hit)
+        for t in range(1, close.shape[1]):
+            new_session = session_ids[:, t] != session_ids[:, t - 1]
+            # New session → last bar's close IS the prev-day close
+            # Same session → keep carrying forward
+            prev_day[:, t] = torch.where(new_session, close[:, t - 1], prev_day[:, t - 1])
+        return prev_day
+
     def build_limit_hit_masks(
         self,
         *,
         close: torch.Tensor,
+        prev_day_close: torch.Tensor,
         symbols: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Detect limit-up and limit-down hits.
 
+        Uses change **relative to previous day's close** (not adjacent bar),
+        matching A-share 涨跌停 definition.
+
         Returns:
-            limit_up:   Bool[assets, time] — 涨停, cannot BUY  (price already at ceiling)
-            limit_down: Bool[assets, time] — 跌停, cannot SELL (price already at floor)
+            limit_up:   Bool[assets, time] — 涨停, cannot BUY
+            limit_down: Bool[assets, time] — 跌停, cannot SELL
         """
-        # pct change vs prev bar
-        prev_close = torch.zeros_like(close)
-        prev_close[:, 1:] = close[:, :-1]
-        prev_close[:, 0] = close[:, 0]  # no change on first bar
+        pct_change = (close - prev_day_close) / (prev_day_close.abs() + 1e-8)
 
-        pct_change = (close - prev_close) / (prev_close.abs() + 1e-8)
-
-        # per-code limit thresholds
         thresholds = torch.tensor(
             [_limit_pct_for_code(s) for s in symbols],
             dtype=close.dtype,
@@ -148,7 +158,7 @@ class ChinaMarketRules:
         limit_up = pct_change >= (thresholds - tol)
         limit_down = pct_change <= (-thresholds + tol)
 
-        # First bar is never a limit hit
+        # First bar of the dataset is never a limit hit
         limit_up[:, 0] = False
         limit_down[:, 0] = False
         return limit_up, limit_down

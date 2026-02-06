@@ -105,6 +105,14 @@ class ChinaMinuteDataLoader:
             return mode, hold_bars
 
         if mode == "signal_to_exit":
+            # signal_to_exit = buy & sell same day → violates T+1 for stocks
+            rules = ChinaMarketRules.from_config()
+            if rules.enforce_t_plus_one:
+                raise ValueError(
+                    "CN_TARGET_RET_MODE='signal_to_exit' with CN_DECISION_FREQ='daily' "
+                    "is incompatible with T+1 settlement.  Use 'close_to_close' or "
+                    "disable T+1 via CN_ENFORCE_T_PLUS_ONE=0."
+                )
             return mode, 0
 
         hold_days = int(ModelConfig.CN_HOLD_DAYS)
@@ -716,10 +724,12 @@ class ChinaMinuteDataLoader:
         raw_data_cache["t_plus_one_required"] = t_plus_one_required
         raw_data_cache["t_plus_one_sell_block"] = t_plus_one_sell_block
 
-        # Price-limit (涨跌停) masks
+        # Price-limit (涨跌停) masks — use prev-day close, not prev-bar
         close = raw_data_cache["close"]
+        prev_day_close = rules.compute_prev_day_close(close, session_ids)
+        raw_data_cache["prev_day_close"] = prev_day_close
         limit_up, limit_down = rules.build_limit_hit_masks(
-            close=close, symbols=symbols,
+            close=close, prev_day_close=prev_day_close, symbols=symbols,
         )
         raw_data_cache["limit_up"] = limit_up.float()
         raw_data_cache["limit_down"] = limit_down.float()

@@ -48,7 +48,7 @@ def normalize_date(value: str) -> str:
             return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y%m%d")
         except ValueError:
             pass
-    return text
+    raise ValueError(f"Cannot parse date: {text!r}")
 
 
 def is_header(row: List[str]) -> bool:
