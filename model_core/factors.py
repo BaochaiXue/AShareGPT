@@ -279,10 +279,11 @@ class FeatureEngineer:
             feat_dict['EMA60'] = get_col(["EMA_60"])
             feat_dict['TEMA10'] = get_col(["TEMA_10"])
             
-            feat_dict['BB_UPPER'] = get_col(["BBU_5_2.0", "BBU_20_2.0"])
-            feat_dict['BB_MID'] = get_col(["BBM_5_2.0", "BBM_20_2.0"])
-            feat_dict['BB_LOWER'] = get_col(["BBL_5_2.0", "BBL_20_2.0"])
-            feat_dict['BB_WIDTH'] = get_col(["BBB_5_2.0", "BBB_20_2.0"])
+            # Strategy requests BBANDS length=20, so map only to 20-bar outputs.
+            feat_dict['BB_UPPER'] = get_col(["BBU_20_2.0", "BBU_20_2"])
+            feat_dict['BB_MID'] = get_col(["BBM_20_2.0", "BBM_20_2"])
+            feat_dict['BB_LOWER'] = get_col(["BBL_20_2.0", "BBL_20_2"])
+            feat_dict['BB_WIDTH'] = get_col(["BBB_20_2.0", "BBB_20_2"])
             
             feat_dict['MIDPOINT'] = get_col(["MIDPOINT_2"])
             feat_dict['MIDPRICE'] = get_col(["MIDPRICE_2"])

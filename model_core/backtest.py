@@ -203,13 +203,18 @@ class ChinaBacktest:
         if t_plus_one_required is None:
             t_plus_one_required = torch.zeros_like(desired_position)
         if session_id is None:
-            # Default: each bar = unique session → locked_buy resets every step.
-            # Safest fallback when caller doesn't provide session info.
-            session_id = torch.arange(
-                desired_position.shape[1],
-                dtype=desired_position.dtype,
-                device=desired_position.device,
-            ).unsqueeze(0).expand_as(desired_position)
+            if sell_block is not None:
+                # Explicit sell-block inputs are interpreted as same-session flags unless caller
+                # provides per-bar session ids.
+                session_id = torch.zeros_like(desired_position)
+            else:
+                # Default: each bar = unique session → locked_buy resets every step.
+                # Safest fallback when caller doesn't provide session info.
+                session_id = torch.arange(
+                    desired_position.shape[1],
+                    dtype=desired_position.dtype,
+                    device=desired_position.device,
+                ).unsqueeze(0).expand_as(desired_position)
 
         prev_session = session_id[:, 0].clone()
 

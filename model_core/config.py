@@ -21,9 +21,9 @@ class ModelConfig:
     SLIPPAGE_IMPACT = float(os.getenv("SLIPPAGE_IMPACT", "0.0"))
     ALLOW_SHORT = os.getenv("ALLOW_SHORT", "0") == "1"
     SIGNAL_LAG = int(os.getenv("CN_SIGNAL_LAG", "1"))
-    # Annualization: auto-compute for 1min (240 bars/day * 240 trading days)
+    # Annualization: auto-compute for 1min (240 bars/day * 252 trading days)
     _CN_DECISION_FREQ_RAW = os.getenv("CN_DECISION_FREQ", "daily").strip().lower()
-    _DEFAULT_ANN = "57600" if _CN_DECISION_FREQ_RAW == "1min" else "252"
+    _DEFAULT_ANN = "60480" if _CN_DECISION_FREQ_RAW == "1min" else "252"
     ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", _DEFAULT_ANN))
     # Price-limit (涨跌停) detection tolerance
     CN_LIMIT_HIT_TOL = float(os.getenv("CN_LIMIT_HIT_TOL", "0.001"))

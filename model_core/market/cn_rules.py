@@ -15,15 +15,21 @@ def _normalize_code(code: str) -> str:
 def _limit_pct_for_code(code: str) -> float:
     """Return price limit percentage for a given A-share code.
 
-    主板(SH 60xxxx / SZ 00xxxx):  ±10%
-    创业板(SZ 300xxx):            ±20%
-    科创板(SH 688xxx):            ±20%
-    北交所(BJ 8xxxxx/4xxxxx):     ±30%  (simplified)
+    Main board (SH 60xxxx / SZ 00xxxx): ±10%
+    ChiNext (SZ 300xxx/301xxx):         ±20%
+    STAR (SH 688xxx):                   ±20%
+    BSE (8xxxxx and common NEEQ roots): ±30%
+    Legacy delisted board (400/420):    ±5%
+
+    Note: listing-day no-limit exemptions need external listing metadata and are
+    handled via optional runtime masks, not just code prefix.
     """
     c = _normalize_code(code)
-    if c.startswith("300") or c.startswith("688"):
+    if c.startswith("400") or c.startswith("420"):
+        return 0.05
+    if c.startswith("300") or c.startswith("301") or c.startswith("688"):
         return 0.20
-    if c.startswith("8") or c.startswith("4"):
+    if c.startswith("8") or c.startswith("43") or c.startswith("83") or c.startswith("87"):
         return 0.30
     return 0.10
 
@@ -136,6 +142,7 @@ class ChinaMarketRules:
         close: torch.Tensor,
         prev_day_close: torch.Tensor,
         symbols: list[str],
+        limit_exempt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Detect limit-up and limit-down hits.
 
@@ -157,6 +164,11 @@ class ChinaMarketRules:
         tol = self.limit_hit_tol
         limit_up = pct_change >= (thresholds - tol)
         limit_down = pct_change <= (-thresholds + tol)
+
+        if limit_exempt is not None:
+            exempt = limit_exempt > 0
+            limit_up = limit_up & (~exempt)
+            limit_down = limit_down & (~exempt)
 
         # First bar of the dataset is never a limit hit
         limit_up[:, 0] = False

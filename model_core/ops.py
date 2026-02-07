@@ -125,5 +125,21 @@ def get_ops_config() -> list[tuple[str, Callable[..., torch.Tensor], int]]:
     return OPS_CONFIG_DAILY
 
 
-# Default export for backward compatibility
-OPS_CONFIG = get_ops_config()
+class _OpsConfigProxy:
+    """Backward-compatible dynamic view over `get_ops_config()`."""
+
+    def __iter__(self):
+        return iter(get_ops_config())
+
+    def __len__(self):
+        return len(get_ops_config())
+
+    def __getitem__(self, idx):
+        return get_ops_config()[idx]
+
+    def __repr__(self) -> str:
+        return repr(get_ops_config())
+
+
+# Backward-compatible export that still tracks runtime CN_DECISION_FREQ changes.
+OPS_CONFIG = _OpsConfigProxy()

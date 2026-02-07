@@ -103,7 +103,11 @@ def process_file(path: Path, dry_run: bool) -> FileStats:
             stats.invalid_rows += 1
             continue
 
-        date = normalize_date(date_raw)
+        try:
+            date = normalize_date(date_raw)
+        except ValueError:
+            stats.invalid_rows += 1
+            continue
         if prev_date is not None and date < prev_date:
             stats.order_issues += 1
         prev_date = date

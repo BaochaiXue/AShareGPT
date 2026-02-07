@@ -326,27 +326,28 @@ class _PpoLoop:
         return legal
 
     @staticmethod
+    def _avg_or_nan(values):
+        return sum(values) / len(values) if values else float("nan")
+
+    @staticmethod
     def _record(h, step, best, rewards, ts, vs, pl, vl, ent, sr):
-        def _avg(lst): return sum(lst) / len(lst) if lst else float("nan")
         h["step"].append(step)
         h["avg_reward"].append(float(rewards.mean().item()))
         h["best_score"].append(best)
         h["policy_loss"].append(pl)
         h["value_loss"].append(vl)
         h["entropy"].append(ent)
-        h["avg_train_score"].append(_avg(ts))
-        h["avg_val_score"].append(_avg(vs))
-        if sr is not None:
-            h["stable_rank"].append(sr)
+        h["avg_train_score"].append(_PpoLoop._avg_or_nan(ts))
+        h["avg_val_score"].append(_PpoLoop._avg_or_nan(vs))
+        h["stable_rank"].append(float("nan") if sr is None else sr)
 
     @staticmethod
     def _postfix(best, rewards, pl, vl, sr, ts, vs):
-        def _avg(lst): return sum(lst) / len(lst) if lst else float("nan")
         p = {"AvgRew": f"{rewards.mean():.3f}", "Best": f"{best:.3f}",
              "PLoss": f"{pl:.3f}", "VLoss": f"{vl:.3f}"}
         if sr is not None:
             p["Rank"] = f"{sr:.2f}"
-        at, av = _avg(ts), _avg(vs)
+        at, av = _PpoLoop._avg_or_nan(ts), _PpoLoop._avg_or_nan(vs)
         if not math.isnan(at):
             p["Train"] = f"{at:.3f}"
         if not math.isnan(av):

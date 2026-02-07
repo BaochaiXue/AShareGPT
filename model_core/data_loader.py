@@ -209,10 +209,20 @@ class ChinaMinuteDataLoader:
         if adj is None or adj.empty:
             frame["adj_factor"] = 1.0
             return frame
-        merged = frame.merge(adj, on="date", how="left").sort_values("date")
+        merged = frame.merge(adj, on="date", how="left")
+        if "trade_time" in merged.columns:
+            merged = merged.sort_values("trade_time")
+        else:
+            merged = merged.sort_values("date")
         merged["adj_factor"] = merged["adj_factor"].ffill().fillna(1.0)
+        safe_adj = merged["adj_factor"].astype("float64").replace(0.0, 1.0)
         for col in ("open", "high", "low", "close"):
-            merged[col] = merged[col].astype("float64") * merged["adj_factor"]
+            merged[col] = merged[col].astype("float64") * safe_adj
+        # Keep turnover-related features on the same split-adjusted scale as prices.
+        if "volume" in merged.columns:
+            merged["volume"] = (
+                merged["volume"].astype("float64") / safe_adj
+            ).replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
         return merged
 
     def _resolve_split_sizes(self, total_len: int) -> tuple[int, int, int]:
@@ -510,39 +520,6 @@ class ChinaMinuteDataLoader:
         minute_df["date"] = minute_df["trade_time"].dt.normalize()
         return minute_df
 
-    def _load_minute_records_for_code(
-        self,
-        *,
-        code: str,
-        years: list[int],
-        start_dt: Optional[pd.Timestamp],
-        end_dt: Optional[pd.Timestamp],
-        end_dt_exclusive: Optional[pd.Timestamp],
-    ) -> list[dict[str, float | pd.Timestamp]]:
-        minute_df = self._load_minute_frame_for_code(
-            code=code,
-            years=years,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            end_dt_exclusive=end_dt_exclusive,
-        )
-        if minute_df.empty:
-            return []
-
-        return [
-            {
-                "trade_time": row.trade_time,
-                "date": row.date,
-                "open": float(row.open),
-                "high": float(row.high),
-                "low": float(row.low),
-                "close": float(row.close),
-                "volume": float(row.vol),
-                "amount": float(row.amount),
-            }
-            for row in minute_df.itertuples(index=False)
-        ]
-
     def _build_per_code_frames(
         self,
         *,
@@ -561,13 +538,18 @@ class ChinaMinuteDataLoader:
         per_code_frames: dict[str, pd.DataFrame] = {}
         for code in codes:
             if decision_freq == "1min":
-                records = self._load_minute_records_for_code(
+                frame = self._load_minute_frame_for_code(
                     code=code,
                     years=years,
                     start_dt=start_dt,
                     end_dt=end_dt,
                     end_dt_exclusive=end_dt_exclusive,
                 )
+                if frame.empty:
+                    continue
+                frame = frame.rename(columns={"vol": "volume"}).loc[
+                    :, ["trade_time", "date", "open", "high", "low", "close", "volume", "amount"]
+                ]
             else:
                 records = self._load_daily_records_for_code(
                     code=code,
@@ -580,12 +562,9 @@ class ChinaMinuteDataLoader:
                     bar_style=bar_style,
                     target_ret_mode=target_ret_mode,
                 )
-            if not records:
-                continue
-            frame = pd.DataFrame(records)
-            if decision_freq == "1min":
-                frame = frame.drop_duplicates(subset=["trade_time"], keep="last").sort_values("trade_time")
-            else:
+                if not records:
+                    continue
+                frame = pd.DataFrame(records)
                 frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
