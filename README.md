@@ -1,84 +1,237 @@
 # AShareGPT
 
-**AShareGPT** is a specialized Alpha mining and backtesting system for the Chinese A-share market. It combines **Reinforcement Learning (PPO)** with a **Symbolic Transformer (NeuralSymbolicAlphaGenerator)** to automatically generate, validate, and optimize formulaic alpha factors.
+**AShareGPT** is an automated alpha factor mining and backtesting system for the Chinese A-share market. It combines **Proximal Policy Optimization (PPO)** with a **Looped Transformer** to discover readable, formulaic alpha factors in Reverse Polish Notation (RPN).
 
-Unlike traditional "black box" deep learning models that predict prices directly, AShareGPT operates as a "White Box" Agent: it writes readable mathematical formulas (e.g., `(OPEN / MA_20) - 1`) that are then rigorously backtested.
+Unlike black-box models that predict prices directly, AShareGPT is a **white-box agent**: it generates interpretable mathematical formulas (e.g., `CLOSE / SMA_20 - 1`) that are rigorously backtested with realistic A-share market rules.
 
-## 📂 Data Layout
+## ✨ Key Features
 
-The system expects data in the following structure under the project root:
+- **Symbolic Alpha Discovery** — PPO-trained Transformer generates human-readable RPN formulas
+- **60+ Technical Indicators** — via `pandas_ta` Strategy API (RSI, MACD, Bollinger Bands, OBV, etc.)
+- **Dual Decision Frequency** — `daily` (aggregated bars) or `1min` (raw minute-level decisions)
+- **A-share Market Rules** — T+1 settlement enforcement, per-code price-limit (涨跌停) detection, T+0 ETF whitelisting
+- **Walk-Forward Optimization** — rolling train/val/test windows to reduce overfitting
+- **Adjust Factor Support** — automatic 前复权 price adjustment with code alias fallback
+- **GPU Acceleration** — all tensor operations on CUDA when available
+
+## 📂 Project Structure
 
 ```text
 AShareGPT/
-├── data/
-│   ├── 2025/               <-- Year Folders (Minute CSVs)
-│   │   ├── 000001.SZ.csv
-│   │   ├── 600519.SH.csv
-│   │   └── ...
-│   ├── 复权因子/           <-- Adjust Factors (Optional but Recommended)
-│   │   ├── 000001.SZ.csv
-│   │   └── ...
-│   └── ...
+├── model_core/                  # Core library
+│   ├── config.py                # All configuration (env-var driven)
+│   ├── model.py                 # Looped Transformer + SwiGLU + RMSNorm
+│   ├── training.py              # PPO loop, reward orchestration, walk-forward
+│   ├── vm.py                    # Stack-based VM for RPN formula execution
+│   ├── ops.py                   # Symbolic operators (freq-adaptive windows)
+│   ├── factors.py               # Feature engineering (60+ indicators)
+│   ├── data_loader.py           # Minute CSV → tensors pipeline
+│   ├── backtest.py              # Vectorized backtester with execution rules
+│   ├── code_alias.py            # Old→new code mapping for adj factors
+│   ├── market/
+│   │   └── cn_rules.py          # T+1, price-limit, session-id logic
+│   ├── data/
+│   │   └── io.py                # Encoding-robust CSV I/O utilities
+│   └── application/
+│       └── services/            # Compatibility API wrapper
+├── run_cn_train.py              # Entry point: alpha mining
+├── run_cn_backtest.py           # Entry point: strategy backtest
+├── clean_adj_factors.py         # Utility: normalize adjust factor CSVs
+├── unify_data.py                # Utility: merge raw downloads into per-code files
+├── scripts/
+│   └── backfill_adj_by_alias.py # Utility: fill missing adj factors via alias map
+├── tests/                       # Pytest suite
+├── .env.example                 # Full configuration reference
+└── data/                        # Data root (not tracked in git)
+    ├── 2025/                    # Year folders with minute CSVs
+    │   ├── 000001.SZ.csv
+    │   └── ...
+    └── 复权因子/                 # Adjust factor CSVs (optional)
+        ├── 000001.SZ.csv
+        └── ...
 ```
 
-### 1. Minute Data (`data/YYYY/<code>.csv`)
-Raw minute-level OHLCV data.
-- **Required Columns**: `trade_time`, `open`, `high`, `low`, `close`, `vol`, `amount`
-- **Logic**: The loader downsamples this to daily signals. By default, it uses `10:00` for entry and `15:00` for exit (configurable).
+## 📊 Data Format
 
-### 2. Adjust Factors (`data/复权因子/<code>.csv`)
-Used to handle splits and dividends.
-- **Required Columns**: `date`, `adj_factor`
-- **Fallback**: If missing, factor defaults to `1.0`.
+### Minute Data (`data/YYYY/<code>.csv`)
+
+Raw minute-level OHLCV bars.
+
+| Column | Type | Description |
+|:---|:---|:---|
+| `trade_time` | string | `YYYY-MM-DD HH:MM:SS` |
+| `open` | float | Open price |
+| `high` | float | High price |
+| `low` | float | Low price |
+| `close` | float | Close price |
+| `vol` | float | Volume |
+| `amount` | float | Turnover |
+
+### Adjust Factors (`data/复权因子/<code>.csv`)
+
+| Column | Type | Description |
+|:---|:---|:---|
+| `code` | string | Security code |
+| `date` | string | Date (`YYYYMMDD` or `YYYY-MM-DD`) |
+| `adj_factor` | float | Cumulative adjust factor |
+
+If a file is missing, the factor defaults to `1.0`. Code aliases (e.g., old code → new code after restructuring) are resolved via `code_alias_map.csv`.
 
 ## 🚀 Quick Start
 
-### 1. Requirements
-Ensure you have the necessary dependencies. Note that `pandas_ta` is required but might be missing from `requirements.txt`.
+### 1. Install
 
 ```bash
 pip install -r requirements.txt
-pip install pandas_ta  # or pandas_ta_classic
+pip install pandas-ta-classic  # preferred; pandas_ta also works as fallback
 ```
 
-### 2. Train (Mine Alphas)
-Start the PPO training loop to discover new formulas.
+### 2. Configure
+
+Copy and customize the environment file:
+
+```bash
+cp .env.example .env
+# Edit .env to set data paths, decision frequency, etc.
+```
+
+### 3. Train (Mine Alphas)
 
 ```bash
 python run_cn_train.py
 ```
-- **Output**: The best discovered formula is saved to `best_cn_strategy.json`.
-- **Compute**: Supports CUDA if available.
 
-### 3. Backtest
-Validate a discovered strategy on historical data.
+- Discovers formulaic alpha factors via PPO reinforcement learning
+- Best formula saved to `best_cn_strategy.json`
+- Supports walk-forward optimization (`CN_WALK_FORWARD=1`)
+- CUDA auto-detected
+
+### 4. Backtest
 
 ```bash
 python run_cn_backtest.py --strategy best_cn_strategy.json
 ```
-- **Key Metrics**: Sharpe Ratio, Sortino Ratio, Annual Returns, Max Drawdown.
-- **Curve Output**: Use `--curve-out equity.csv` to save the capital curve.
+
+Options:
+- `--symbols 000001.SZ,600519.SH` — restrict to specific codes
+- `--start-date 2025-01-01` / `--end-date 2025-06-01` — date range
+- `--curve-out equity.csv` — export equity curve
+- `--no-adj` — disable adjust factor application
+
+Key metrics: Sharpe Ratio, Sortino Ratio, Annual Return, Max Drawdown, Win Rate.
 
 ## ⚙️ Configuration
 
-Key settings in `model_core/config.py` can be overridden via Environment Variables:
+All settings are driven by environment variables (see `.env.example` for the full list). Key parameters:
+
+### Data & Symbols
 
 | Variable | Default | Description |
-| :--- | :--- | :--- |
-| `CN_MINUTE_YEARS` | *(Last 2 Years)* | Comma-separated years to load (e.g., `2020,2021,2022`). |
-| `CN_MAX_CODES` | `50` | Max number of stocks to load (set higher for full market). |
-| `CN_SIGNAL_TIME` | `10:00` | Intraday time to generate signal/enter trade. |
-| `CN_EXIT_TIME` | `15:00` | Intraday time to close position. |
-| `TRAIN_STEPS` | `400` | Number of PPO training iterations. |
-| `CN_WALK_FORWARD`| `0` | Set to `1` to enable Walk-Forward Optimization. |
+|:---|:---|:---|
+| `CN_MINUTE_DATA_ROOT` | `data` | Root directory for minute CSVs |
+| `CN_MINUTE_YEARS` | *(auto)* | Comma-separated years to load |
+| `CN_CODES` | *(auto)* | Comma-separated codes; empty = auto-discover |
+| `CN_MAX_CODES` | `50` | Max symbols to load |
+| `CN_MINUTE_DAYS` | `120` | Rolling window when no end date set |
 
-## 🧠 System Architecture
+### Decision Frequency & Returns
 
-- **NeuralSymbolicAlphaGenerator (`model_core/neural_symbolic_alpha_generator.py`)**: A Looped Transformer that generates Reverse Polish Notation (RPN) formulas.
-- **StackVM (`model_core/vm.py`)**: A vectorized stack machine that executes these formulas on GPU tensors.
-- **Engine (`model_core/engine.py`)**: The PPO Reinforcement Learning loop that rewards the model based on Backtest Sharpe Ratio.
-- **Data Loader (`model_core/data_loader.py`)**: Handles complex A-share data alignment, robust normalization, and feature engineering (60+ technical indicators).
+| Variable | Default | Description |
+|:---|:---|:---|
+| `CN_DECISION_FREQ` | `daily` | `daily` or `1min` |
+| `CN_BAR_STYLE` | `daily` | `daily` (full OHLCV) or `signal_snapshot` |
+| `CN_TARGET_RET_MODE` | `close_to_close` | `close_to_close` or `signal_to_exit` |
+| `CN_HOLD_DAYS` | `1` | Hold period for daily frequency |
+| `CN_HOLD_BARS` | `1` | Hold period for 1min frequency |
 
-## Migration Notes
-- **v0.6.0**: `model_core.infrastructure.legacy` removed. Use adapters if needed.
-- **Pandas TA**: Ensure you have a compatible version installed for feature generation (`RSI`, `MACD`, etc.).
+### A-share Market Rules
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `CN_ENFORCE_T_PLUS_ONE` | `1` | Enable T+1 same-day sell blocking |
+| `CN_T0_ALLOWED_CODES` | *(empty)* | Comma-separated T+0 exempt codes (e.g., ETFs) |
+| `CN_LIMIT_HIT_TOL` | `0.001` | Price-limit detection tolerance |
+
+### Training (PPO)
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `TRAIN_STEPS` | `400` | PPO training iterations |
+| `BATCH_SIZE` | `1024` | Formulas sampled per step |
+| `MAX_FORMULA_LEN` | `8` | Max tokens per formula |
+| `PPO_EPOCHS` | `4` | PPO update epochs per step |
+
+### Walk-Forward Optimization
+
+| Variable | Default | Description |
+|:---|:---|:---|
+| `CN_WALK_FORWARD` | `0` | Set to `1` to enable |
+| `CN_WFO_TRAIN_DAYS` | `60` | Training window |
+| `CN_WFO_VAL_DAYS` | `20` | Validation window |
+| `CN_WFO_TEST_DAYS` | `20` | Test window |
+| `CN_WFO_STEP_DAYS` | `20` | Step size between folds |
+
+## 🧪 Data Utilities
+
+### Clean Adjust Factors
+
+Normalize date formats, remove duplicates, and validate adjust factor CSVs:
+
+```bash
+python clean_adj_factors.py data/复权因子/
+```
+
+### Unify Raw Downloads
+
+Merge bulk-downloaded CSVs into per-code files:
+
+```bash
+python unify_data.py --mode all
+```
+
+### Backfill Adj Factors by Alias
+
+Fill missing old-code adjust factor files using new-code mappings:
+
+```bash
+python scripts/backfill_adj_by_alias.py
+```
+
+## 🧠 Architecture Overview
+
+```text
+┌─────────────────────────────────────────────────┐
+│              run_cn_train.py                    │
+│                    │                            │
+│     ┌──────────────▼─────────────┐              │
+│     │     training.py (PPO)      │              │
+│     │  ┌─────────┐ ┌──────────┐  │              │
+│     │  │ Model   │ │ Reward   │  │              │
+│     │  │ (Looped │ │ Orchestr.│  │              │
+│     │  │ Transf.)│ │          │  │              │
+│     │  └────┬────┘ └─────┬────┘  │              │
+│     │       │            │       │              │
+│     │  ┌────▼────┐  ┌────▼────┐  │              │
+│     │  │ StackVM │  │Backtest │  │              │
+│     │  │ (ops.py)│  │ Engine  │  │              │
+│     │  └─────────┘  └─────────┘  │              │
+│     └────────────────────────────┘              │
+│                    │                            │
+│     ┌──────────────▼─────────────┐              │
+│     │   data_loader.py           │              │
+│     │   factors.py (60+ feats)   │              │
+│     │   cn_rules.py (T+1/涨跌停) │              │
+│     └────────────────────────────┘              │
+└─────────────────────────────────────────────────┘
+```
+
+1. **NeuralSymbolicAlphaGenerator** (`model.py`) — Looped Transformer with SwiGLU FFN and RMSNorm that generates RPN token sequences
+2. **StackVM** (`vm.py`) — Executes formulas on GPU tensors using frequency-adaptive operators
+3. **PPO Training** (`training.py`) — Reinforcement learning loop with reward = backtest Sharpe ratio
+4. **ChinaBacktest** (`backtest.py`) — Vectorized backtester enforcing T+1 settlement, price-limit blocking, and tradability masks
+5. **FeatureEngineer** (`factors.py`) — 60+ technical indicators computed via `pandas_ta` Strategy API
+6. **ChinaMarketRules** (`cn_rules.py`) — Session-id tracking, per-code T+1/T+0 classification, 涨跌停 detection
+
+## 📜 License
+
+See [LICENSE](LICENSE) for details.
