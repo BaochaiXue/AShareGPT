@@ -45,6 +45,34 @@ def safe_to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def normalize_code_column(
+    df: pd.DataFrame,
+    *,
+    code_col: str = "code",
+    alias_col: str = "证券代码",
+    fillna_from_alias: bool = False,
+) -> pd.DataFrame:
+    """Normalize security code columns to a canonical ``code`` column.
+
+    Behavior mirrors existing scripts:
+    - If ``code`` is absent but alias exists, rename alias -> code.
+    - If both exist and ``fillna_from_alias`` is True, fill missing code values.
+    - Otherwise, leave the frame unchanged.
+    """
+
+    has_code = code_col in df.columns
+    has_alias = alias_col in df.columns
+
+    if not has_code and has_alias:
+        df = df.rename(columns={alias_col: code_col})
+        has_code = True
+
+    if has_code and has_alias and fillna_from_alias:
+        df[code_col] = df[code_col].fillna(df[alias_col])
+
+    return df
+
+
 def atomic_write_csv(path: Path, df: pd.DataFrame, *, index: bool = False, **kwargs: Any) -> None:
     """Write CSV atomically via a temporary file in the same directory."""
 

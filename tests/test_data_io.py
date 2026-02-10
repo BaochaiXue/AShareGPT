@@ -6,6 +6,7 @@ import pandas as pd
 
 from model_core.data.io import (
     atomic_write_csv,
+    normalize_code_column,
     read_csv_any_encoding,
     read_last_row_token,
     safe_to_datetime,
@@ -45,3 +46,17 @@ def test_safe_converters_coerce_invalid_values() -> None:
     assert pd.isna(dt.iloc[1])
     assert num.iloc[0] == 1.23
     assert pd.isna(num.iloc[1])
+
+
+def test_normalize_code_column_renames_alias_when_code_missing() -> None:
+    df = pd.DataFrame({"证券代码": ["000001.SZ"], "value": [1]})
+    out = normalize_code_column(df)
+    assert "code" in out.columns
+    assert out.iloc[0]["code"] == "000001.SZ"
+
+
+def test_normalize_code_column_optional_fillna() -> None:
+    df = pd.DataFrame({"code": [None, "000002.SZ"], "证券代码": ["000001.SZ", "000002.SZ"]})
+    out = normalize_code_column(df, fillna_from_alias=True)
+    assert out.iloc[0]["code"] == "000001.SZ"
+    assert out.iloc[1]["code"] == "000002.SZ"

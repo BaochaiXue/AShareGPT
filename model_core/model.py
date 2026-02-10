@@ -200,8 +200,6 @@ class LoopedTransformerLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, num_loops: int = 3, dropout: float = 0.1):
         super().__init__()
         self.num_loops = num_loops
-        self.d_model = d_model
-        self.nhead = nhead
 
         # Standard attention components
         self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)

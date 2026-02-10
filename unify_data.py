@@ -8,6 +8,7 @@ from typing import Iterable
 import pandas as pd
 
 from model_core.data.io import (
+    normalize_code_column,
     read_csv_any_encoding,
     read_last_row_token,
     safe_to_datetime,
@@ -63,6 +64,20 @@ def iter_csv_files(root: Path) -> Iterable[Path]:
     return sorted(root.rglob("*.csv"))
 
 
+def _prepare_code_column(
+    df: pd.DataFrame,
+    *,
+    path: Path,
+    tag: str,
+    fillna_from_alias: bool,
+) -> pd.DataFrame | None:
+    df = normalize_code_column(df, fillna_from_alias=fillna_from_alias)
+    if "code" not in df.columns:
+        print(f"[{tag}] missing code column: {path}")
+        return None
+    return df
+
+
 def process_minute_data(minute_root: Path, data_root: Path, dry_run: bool, max_files: int) -> None:
     files = list(iter_csv_files(minute_root))
     if max_files:
@@ -81,11 +96,14 @@ def process_minute_data(minute_root: Path, data_root: Path, dry_run: bool, max_f
             dtype={"证券代码": "string", "code": "string", "trade_time": "string"},
             usecols=lambda c: c in {"证券代码", "code", "trade_time", "open", "high", "low", "close", "vol", "amount"},
         )
-        if "code" not in df.columns and "证券代码" not in df.columns:
-            print(f"[minute] missing code column: {path}")
+        df = _prepare_code_column(
+            df,
+            path=path,
+            tag="minute",
+            fillna_from_alias=False,
+        )
+        if df is None:
             continue
-        if "code" not in df.columns:
-            df = df.rename(columns={"证券代码": "code"})
 
         for code, group in df.groupby("code", sort=False):
             output_path = data_root / year / f"{code}.csv"
@@ -120,14 +138,14 @@ def process_adj_factors(adj_root: Path, data_root: Path, dry_run: bool, max_file
             dtype={"证券代码": "string", "code": "string", "date": "string"},
             usecols=lambda c: c in {"证券代码", "code", "date", "adj_factor"},
         )
-        if "code" not in df.columns and "证券代码" not in df.columns:
-            print(f"[adj] missing code column: {path}")
+        df = _prepare_code_column(
+            df,
+            path=path,
+            tag="adj",
+            fillna_from_alias=True,
+        )
+        if df is None:
             continue
-        if "code" not in df.columns:
-            df = df.rename(columns={"证券代码": "code"})
-        else:
-            if "证券代码" in df.columns:
-                df["code"] = df["code"].fillna(df["证券代码"])
 
         for code, group in df.groupby("code", sort=False):
             output_path = data_root / "复权因子" / f"{code}.csv"

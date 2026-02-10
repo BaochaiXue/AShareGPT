@@ -13,7 +13,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from model_core.code_alias import load_code_alias_map  # noqa: E402
-from model_core.data.io import read_csv_any_encoding, safe_to_numeric  # noqa: E402
+from model_core.data.io import normalize_code_column, read_csv_any_encoding, safe_to_numeric  # noqa: E402
 
 
 def read_adj_csv(path: Path) -> pd.DataFrame:
@@ -37,8 +37,7 @@ def collect_minute_codes(data_root: Path) -> set[str]:
 def normalize_adj(df: pd.DataFrame, old_code: str) -> pd.DataFrame:
     if df.empty:
         return df
-    if "code" not in df.columns and "证券代码" in df.columns:
-        df = df.rename(columns={"证券代码": "code"})
+    df = normalize_code_column(df, fillna_from_alias=False)
     for col in ("date", "adj_factor"):
         if col not in df.columns:
             return pd.DataFrame()

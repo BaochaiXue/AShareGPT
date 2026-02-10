@@ -73,6 +73,34 @@ class FeatureEngineer:
         return torch.clamp(norm, -clip, clip)
 
     @staticmethod
+    def _get_col_values(
+        df: pd.DataFrame,
+        name_patterns: list[str],
+        *,
+        asset_idx: int,
+        strict_indicator_mapping: bool,
+        missing_indicator_patterns: set[str],
+        fallback_values,
+    ):
+        """Return an indicator column by exact/prefix match with optional strictness."""
+        for pat in name_patterns:
+            if pat in df.columns:
+                return df[pat].values
+        for col in df.columns:
+            for pat in name_patterns:
+                if col.startswith(pat):
+                    return df[col].values
+
+        pattern_desc = " | ".join(name_patterns)
+        if strict_indicator_mapping:
+            raise ValueError(
+                f"Missing indicator mapping [{pattern_desc}] for asset index {asset_idx}. "
+                "Set CN_STRICT_FEATURE_INDICATORS=0 to downgrade to zero-fallback."
+            )
+        missing_indicator_patterns.add(pattern_desc)
+        return fallback_values * 0
+
+    @staticmethod
     def compute_features(
         raw_dict: dict[str, torch.Tensor],
         *,
@@ -176,6 +204,15 @@ class FeatureEngineer:
         )
         
         missing_indicator_patterns: set[str] = set()
+        def get_col(df: pd.DataFrame, asset_idx: int, name_patterns: list[str]):
+            return FeatureEngineer._get_col_values(
+                df,
+                name_patterns,
+                asset_idx=asset_idx,
+                strict_indicator_mapping=strict_indicator_mapping,
+                missing_indicator_patterns=missing_indicator_patterns,
+                fallback_values=df["close"].values,
+            )
 
         # Iterate over each asset
         for i in range(n_assets):
@@ -196,30 +233,6 @@ class FeatureEngineer:
                 ta_accessor.cores = 0
             ta_accessor.strategy(CustomStrategy)
             
-            # --- Map implementation output columns to FEATURES list ---
-            # pandas_ta auto-names columns like "RSI_14", "MACD_12_26_9", etc.
-            # We need to map them rigorously.
-            
-            # Helper to safely get col
-            def get_col(name_patterns):
-                # patterns: list of possible names, e.g. ["RSI_14", "RSI"]
-                for pat in name_patterns:
-                    if pat in df.columns:
-                        return df[pat].values
-                # Prefix search
-                for col in df.columns:
-                    for pat in name_patterns:
-                        if col.startswith(pat):
-                            return df[col].values
-                pattern_desc = " | ".join(name_patterns)
-                if strict_indicator_mapping:
-                    raise ValueError(
-                        f"Missing indicator mapping [{pattern_desc}] for asset index {i}. "
-                        "Set CN_STRICT_FEATURE_INDICATORS=0 to downgrade to zero-fallback."
-                    )
-                missing_indicator_patterns.add(pattern_desc)
-                return df['close'].values * 0 # Fallback
-            
             # 1. Base Prices
             feat_dict = {}
             feat_dict['OPEN'] = df['open'].values
@@ -236,57 +249,57 @@ class FeatureEngineer:
             feat_dict['WCLOSE'] = (df['high'].values + df['low'].values + 2.0 * df['close'].values) / 4.0
             
             # 3. Returns
-            feat_dict['RET'] = get_col(["PCTRET_1"])
-            feat_dict['RET5'] = get_col(["PCTRET_5"])
-            feat_dict['RET10'] = get_col(["PCTRET_10"])
-            feat_dict['RET20'] = get_col(["PCTRET_20"])
-            feat_dict['LOG_RET'] = get_col(["LOGRET_1"])
+            feat_dict['RET'] = get_col(df, i, ["PCTRET_1"])
+            feat_dict['RET5'] = get_col(df, i, ["PCTRET_5"])
+            feat_dict['RET10'] = get_col(df, i, ["PCTRET_10"])
+            feat_dict['RET20'] = get_col(df, i, ["PCTRET_20"])
+            feat_dict['LOG_RET'] = get_col(df, i, ["LOGRET_1"])
             
             # 4. Volatility
-            feat_dict['TR'] = get_col(["TR", "TRUERANGE"])
-            feat_dict['ATR14'] = get_col(["ATR_14", "ATRr_14"])
-            feat_dict['NATR14'] = get_col(["NATR_14"])
+            feat_dict['TR'] = get_col(df, i, ["TR", "TRUERANGE"])
+            feat_dict['ATR14'] = get_col(df, i, ["ATR_14", "ATRr_14"])
+            feat_dict['NATR14'] = get_col(df, i, ["NATR_14"])
             
             # 5. Momentum
-            feat_dict['RSI14'] = get_col(["RSI_14"])
-            feat_dict['RSI24'] = get_col(["RSI_24"])
-            feat_dict['MACD'] = get_col(["MACD_12_26_9"])
-            feat_dict['MACDh'] = get_col(["MACDh_12_26_9"])
-            feat_dict['MACDs'] = get_col(["MACDs_12_26_9"])
-            feat_dict['BOP'] = get_col(["BOP"])
-            feat_dict['CCI14'] = get_col(["CCI_14_0.015"])
-            feat_dict['CMO14'] = get_col(["CMO_14"])
-            feat_dict['KDJ_K'] = get_col(["K_9_3"])
-            feat_dict['KDJ_D'] = get_col(["D_9_3"])
-            feat_dict['KDJ_J'] = get_col(["J_9_3"])
-            feat_dict['MOM10'] = get_col(["MOM_10"])
-            feat_dict['ROC10'] = get_col(["ROC_10"])
-            feat_dict['PPO'] = get_col(["PPO_12_26_9"])
-            feat_dict['PPOh'] = get_col(["PPOh_12_26_9"])
-            feat_dict['PPOs'] = get_col(["PPOs_12_26_9"])
-            feat_dict['TSI'] = get_col(["TSI_13_25_13"])
-            feat_dict['UO'] = get_col(["UO_7_14_28"])
-            feat_dict['WILLR'] = get_col(["WILLR_14"])
+            feat_dict['RSI14'] = get_col(df, i, ["RSI_14"])
+            feat_dict['RSI24'] = get_col(df, i, ["RSI_24"])
+            feat_dict['MACD'] = get_col(df, i, ["MACD_12_26_9"])
+            feat_dict['MACDh'] = get_col(df, i, ["MACDh_12_26_9"])
+            feat_dict['MACDs'] = get_col(df, i, ["MACDs_12_26_9"])
+            feat_dict['BOP'] = get_col(df, i, ["BOP"])
+            feat_dict['CCI14'] = get_col(df, i, ["CCI_14_0.015"])
+            feat_dict['CMO14'] = get_col(df, i, ["CMO_14"])
+            feat_dict['KDJ_K'] = get_col(df, i, ["K_9_3"])
+            feat_dict['KDJ_D'] = get_col(df, i, ["D_9_3"])
+            feat_dict['KDJ_J'] = get_col(df, i, ["J_9_3"])
+            feat_dict['MOM10'] = get_col(df, i, ["MOM_10"])
+            feat_dict['ROC10'] = get_col(df, i, ["ROC_10"])
+            feat_dict['PPO'] = get_col(df, i, ["PPO_12_26_9"])
+            feat_dict['PPOh'] = get_col(df, i, ["PPOh_12_26_9"])
+            feat_dict['PPOs'] = get_col(df, i, ["PPOs_12_26_9"])
+            feat_dict['TSI'] = get_col(df, i, ["TSI_13_25_13"])
+            feat_dict['UO'] = get_col(df, i, ["UO_7_14_28"])
+            feat_dict['WILLR'] = get_col(df, i, ["WILLR_14"])
             
             # 6. Overlap
-            feat_dict['SMA5'] = get_col(["SMA_5"])
-            feat_dict['SMA10'] = get_col(["SMA_10"])
-            feat_dict['SMA20'] = get_col(["SMA_20"])
-            feat_dict['SMA60'] = get_col(["SMA_60"])
-            feat_dict['EMA5'] = get_col(["EMA_5"])
-            feat_dict['EMA10'] = get_col(["EMA_10"])
-            feat_dict['EMA20'] = get_col(["EMA_20"])
-            feat_dict['EMA60'] = get_col(["EMA_60"])
-            feat_dict['TEMA10'] = get_col(["TEMA_10"])
+            feat_dict['SMA5'] = get_col(df, i, ["SMA_5"])
+            feat_dict['SMA10'] = get_col(df, i, ["SMA_10"])
+            feat_dict['SMA20'] = get_col(df, i, ["SMA_20"])
+            feat_dict['SMA60'] = get_col(df, i, ["SMA_60"])
+            feat_dict['EMA5'] = get_col(df, i, ["EMA_5"])
+            feat_dict['EMA10'] = get_col(df, i, ["EMA_10"])
+            feat_dict['EMA20'] = get_col(df, i, ["EMA_20"])
+            feat_dict['EMA60'] = get_col(df, i, ["EMA_60"])
+            feat_dict['TEMA10'] = get_col(df, i, ["TEMA_10"])
             
             # Strategy requests BBANDS length=20, so map only to 20-bar outputs.
-            feat_dict['BB_UPPER'] = get_col(["BBU_20_2.0", "BBU_20_2"])
-            feat_dict['BB_MID'] = get_col(["BBM_20_2.0", "BBM_20_2"])
-            feat_dict['BB_LOWER'] = get_col(["BBL_20_2.0", "BBL_20_2"])
-            feat_dict['BB_WIDTH'] = get_col(["BBB_20_2.0", "BBB_20_2"])
+            feat_dict['BB_UPPER'] = get_col(df, i, ["BBU_20_2.0", "BBU_20_2"])
+            feat_dict['BB_MID'] = get_col(df, i, ["BBM_20_2.0", "BBM_20_2"])
+            feat_dict['BB_LOWER'] = get_col(df, i, ["BBL_20_2.0", "BBL_20_2"])
+            feat_dict['BB_WIDTH'] = get_col(df, i, ["BBB_20_2.0", "BBB_20_2"])
             
-            feat_dict['MIDPOINT'] = get_col(["MIDPOINT_2"])
-            feat_dict['MIDPRICE'] = get_col(["MIDPRICE_2"])
+            feat_dict['MIDPOINT'] = get_col(df, i, ["MIDPOINT_2"])
+            feat_dict['MIDPRICE'] = get_col(df, i, ["MIDPRICE_2"])
             if "PSARl_0.02_0.2" in df.columns and "PSARs_0.02_0.2" in df.columns:
                 sar_series = df["PSARl_0.02_0.2"].combine_first(df["PSARs_0.02_0.2"]).fillna(0.0)
                 feat_dict['SAR'] = sar_series.values
@@ -295,13 +308,13 @@ class FeatureEngineer:
             elif "PSARs_0.02_0.2" in df.columns:
                 feat_dict['SAR'] = df["PSARs_0.02_0.2"].fillna(0.0).values
             else:
-                feat_dict['SAR'] = get_col(["SAR"])
+                feat_dict['SAR'] = get_col(df, i, ["SAR"])
             
             # 7. Volume
-            feat_dict['OBV'] = get_col(["OBV"])
-            feat_dict['AD'] = get_col(["AD"])
-            feat_dict['ADOSC'] = get_col(["ADOSC_3_10"])
-            feat_dict['CMF'] = get_col(["CMF_20"])
+            feat_dict['OBV'] = get_col(df, i, ["OBV"])
+            feat_dict['AD'] = get_col(df, i, ["AD"])
+            feat_dict['ADOSC'] = get_col(df, i, ["ADOSC_3_10"])
+            feat_dict['CMF'] = get_col(df, i, ["CMF_20"])
             typ_price = (df["high"] + df["low"] + df["close"]) / 3.0
             raw_money = typ_price * df["volume"]
             price_delta = typ_price.diff()
