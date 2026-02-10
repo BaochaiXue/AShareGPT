@@ -190,6 +190,7 @@ Some A-share rules require **instrument metadata** (security type, ST flag, list
 
 - **ST/*ST 5% price limit**: not detected automatically. ST stocks are treated as normal board codes (i.e. code-prefix-based limits only).
 - **ETF vs Stock differences**: only modeled via whitelist (T+0 vs T+1). This repo ships a snapshot file `cn_t0_allowed_codes.csv` built from `sse_intraday_turnover_funds.xls` and `szse_intraday_turnover_funds.xlsx` (fetched on 2026-02-10), loaded by default through `CN_T0_ALLOWED_CODES_FILE`. If env+file yield no codes, it falls back to stock-style simplification (all symbols treated as T+1). Fees/taxes are not instrument-type aware unless you run separate universes or keep `CN_STAMP_TAX_RATE=0`.
+- **Current sample data caveat**: the repository's current local `data/YYYY/*.csv` sample is stock-heavy and has no overlap with `cn_t0_allowed_codes.csv`. In that setup, runs will effectively behave as all `T+1` unless you add matching T+0 ETF minute files or explicitly pass a universe containing whitelist codes.
 - **New listing / special IPO limit rules**: not inferred from listing dates. If needed, provide `CN_LIMIT_EXEMPT_FILE` to exempt known date ranges.
 - **Order book / queueing / limit-up封单**: not modeled. Instead, you can optionally enable an approximate execution cap (`CN_ENABLE_LIQUIDITY_CONSTRAINTS=1`) and volume-based impact (`CN_VOLUME_IMPACT>0`) to reduce “ideal fills”.
 
