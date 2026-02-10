@@ -9,7 +9,7 @@ Unlike black-box models that predict prices directly, AShareGPT is a **white-box
 - **Symbolic Alpha Discovery** — PPO-trained Transformer generates human-readable RPN formulas
 - **60+ Technical Indicators** — via `pandas_ta` Strategy API (RSI, MACD, Bollinger Bands, OBV, etc.)
 - **Dual Decision Frequency** — `daily` (aggregated bars) or `1min` (raw minute-level decisions)
-- **A-share Market Rules** — T+1 settlement enforcement, per-code price-limit (涨跌停) detection, T+0 ETF whitelisting
+- **A-share Market Rules** — T+1 settlement enforcement, tick-rounded price-limit (涨跌停) detection, tradable masks, optional liquidity constraints, T+0 whitelisting
 - **Walk-Forward Optimization** — rolling train/val/test windows to reduce overfitting
 - **Adjust Factor Support** — automatic 前复权 price adjustment with code alias fallback
 - **GPU Acceleration** — all tensor operations on CUDA when available
@@ -149,8 +149,21 @@ All settings are driven by environment variables (see `.env.example` for the ful
 | Variable | Default | Description |
 |:---|:---|:---|
 | `CN_ENFORCE_T_PLUS_ONE` | `1` | Enable T+1 same-day sell blocking |
-| `CN_T0_ALLOWED_CODES` | *(empty)* | Comma-separated T+0 exempt codes (e.g., ETFs) |
+| `CN_T0_ALLOWED_CODES_FILE` | `cn_t0_allowed_codes.csv` | CSV whitelist loaded when `CN_T0_ALLOWED_CODES` is empty |
+| `CN_T0_ALLOWED_CODES` | *(empty)* | Comma-separated T+0 exempt codes override (e.g., ETFs); if env+file both resolve empty, all symbols are treated as T+1 |
 | `CN_LIMIT_HIT_TOL` | `0.001` | Price-limit detection tolerance |
+| `CN_TICK_SIZE` | `0.01` | Minimum tick size used for limit-price rounding |
+| `CN_LOT_SIZE` | `100` | Lot size used by liquidity constraints / volume impact |
+| `CN_ENFORCE_TRADING_HOURS` | `1` | Filter minute data to continuous trading hours |
+| `CN_TRADABLE_REQUIRE_LIQUIDITY` | `1` | Infer `tradable=0` when `volume==0` and `amount==0` |
+| `CN_ENABLE_LIQUIDITY_CONSTRAINTS` | `0` | Enable partial-fill style max-trade clamp per bar |
+| `CN_LIQUIDITY_PARTICIPATION_RATE` | `0.05` | Participation cap for `max_trade` (fraction of bar volume) |
+| `CN_VOLUME_IMPACT` | `0.0` | Extra slippage term based on trade size vs volume |
+| `CN_VOLUME_IMPACT_ALPHA` | `0.5` | Exponent for volume impact |
+| `CN_STAMP_TAX_RATE` | `0.0` | Sell-side stamp tax rate (applied uniformly) |
+| `COST_RATE_BUY` | *(unset)* | Optional buy-side commission override (else `COST_RATE`) |
+| `COST_RATE_SELL` | *(unset)* | Optional sell-side commission override (else `COST_RATE`) |
+| `CN_LIMIT_EXEMPT_FILE` | *(unset)* | Optional CSV to disable limit hits for given code/date ranges |
 
 ### Training (PPO)
 
@@ -170,6 +183,15 @@ All settings are driven by environment variables (see `.env.example` for the ful
 | `CN_WFO_VAL_DAYS` | `20` | Validation window |
 | `CN_WFO_TEST_DAYS` | `20` | Test window |
 | `CN_WFO_STEP_DAYS` | `20` | Step size between folds |
+
+## 🧩 Backtest Assumptions & Simplifications
+
+Some A-share rules require **instrument metadata** (security type, ST flag, listing date, trading-status flags) or **L2/LOB** data. With minute OHLCV only, AShareGPT uses the following simplifications:
+
+- **ST/*ST 5% price limit**: not detected automatically. ST stocks are treated as normal board codes (i.e. code-prefix-based limits only).
+- **ETF vs Stock differences**: only modeled via whitelist (T+0 vs T+1). This repo ships a snapshot file `cn_t0_allowed_codes.csv` (SSE ETF category + SZSE ETF list, fetched on 2026-02-10), loaded by default through `CN_T0_ALLOWED_CODES_FILE`. If env+file yield no codes, it falls back to stock-style simplification (all symbols treated as T+1). Fees/taxes are not instrument-type aware unless you run separate universes or keep `CN_STAMP_TAX_RATE=0`.
+- **New listing / special IPO limit rules**: not inferred from listing dates. If needed, provide `CN_LIMIT_EXEMPT_FILE` to exempt known date ranges.
+- **Order book / queueing / limit-up封单**: not modeled. Instead, you can optionally enable an approximate execution cap (`CN_ENABLE_LIQUIDITY_CONSTRAINTS=1`) and volume-based impact (`CN_VOLUME_IMPACT>0`) to reduce “ideal fills”.
 
 ## 🧪 Data Utilities
 

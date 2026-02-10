@@ -194,3 +194,54 @@ def test_t0_asset_can_reduce_same_day_position() -> None:
     assert result.portfolio_returns is not None
     expected = torch.tensor([0.0, 0.0], dtype=torch.float32)
     assert torch.allclose(result.portfolio_returns, expected, atol=1e-6)
+
+
+def test_liquidity_max_trade_clamps_position_changes() -> None:
+    bt = ChinaBacktest()
+    bt.allow_short = False
+    bt.signal_lag = 0
+    bt.cost_rate = 0.0
+    bt.slippage_rate = 0.0
+    bt.slippage_impact = 0.0
+    bt.volume_impact = 0.0
+
+    factors = torch.tensor([[10.0, -10.0, 10.0]], dtype=torch.float32)
+    target_ret = torch.zeros_like(factors)
+    raw_data = _make_raw_data(
+        open_=torch.ones_like(factors) * 10.0,
+        high=torch.ones_like(factors) * 10.0,
+        low=torch.ones_like(factors) * 10.0,
+    )
+    raw_data["tradable"] = torch.ones_like(factors)
+    raw_data["max_trade"] = torch.tensor([[0.4, 0.1, 1.0]], dtype=torch.float32)
+
+    path = bt._build_trading_path(factors=factors, raw_data=raw_data, target_ret=target_ret)
+    expected = torch.tensor([[0.4, 0.3, 1.0]], dtype=torch.float32)
+    assert torch.allclose(path.position, expected, atol=1e-6)
+
+
+def test_sell_side_stamp_tax_is_charged_only_on_reduction() -> None:
+    bt = ChinaBacktest()
+    bt.allow_short = False
+    bt.signal_lag = 0
+    bt.cost_rate = 0.0
+    bt.buy_cost_rate = None
+    bt.sell_cost_rate = None
+    bt.stamp_tax_rate = 0.001
+    bt.slippage_rate = 0.0
+    bt.slippage_impact = 0.0
+    bt.volume_impact = 0.0
+
+    factors = torch.tensor([[10.0, -10.0]], dtype=torch.float32)
+    target_ret = torch.zeros_like(factors)
+    raw_data = _make_raw_data(
+        open_=torch.ones_like(factors) * 10.0,
+        high=torch.ones_like(factors) * 10.0,
+        low=torch.ones_like(factors) * 10.0,
+    )
+    raw_data["tradable"] = torch.ones_like(factors)
+
+    result = bt.evaluate(factors, raw_data, target_ret, return_details=True)
+    assert result.portfolio_returns is not None
+    expected = torch.tensor([0.0, -0.001], dtype=torch.float32)
+    assert torch.allclose(result.portfolio_returns, expected, atol=1e-6)

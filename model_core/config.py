@@ -1,5 +1,54 @@
+import csv
 import os
+from pathlib import Path
+
 import torch
+
+
+def _parse_code_list(raw_codes: str) -> list[str]:
+    return [code.strip() for code in raw_codes.split(",") if code.strip()]
+
+
+def _resolve_repo_path(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parents[1] / path
+
+
+def _load_codes_from_csv(path_value: str) -> list[str]:
+    if not path_value:
+        return []
+    path = _resolve_repo_path(path_value)
+    if not path.exists():
+        return []
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames:
+            field_map = {name.strip().lower(): name for name in reader.fieldnames}
+            code_col = (
+                field_map.get("code")
+                or field_map.get("fund_code")
+                or field_map.get("security_code")
+            )
+            if code_col:
+                parsed_codes = [(row.get(code_col) or "").strip() for row in reader]
+            else:
+                parsed_codes = [(next(iter(row.values()), "") or "").strip() for row in reader]
+        else:
+            handle.seek(0)
+            parsed_codes = [line.strip().split(",")[0] for line in handle if line.strip()]
+
+    seen: set[str] = set()
+    unique_codes: list[str] = []
+    for code in parsed_codes:
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        unique_codes.append(code)
+    return unique_codes
+
 
 class ModelConfig:
     """Configuration for A-share minute backtest/training."""
@@ -17,6 +66,11 @@ class ModelConfig:
 
     # China market settings
     COST_RATE = float(os.getenv("COST_RATE", "0.0005"))
+    # Optional side-specific commission rates. When unset/empty, fall back to COST_RATE.
+    _COST_RATE_BUY_RAW = os.getenv("COST_RATE_BUY", "").strip()
+    COST_RATE_BUY = float(_COST_RATE_BUY_RAW) if _COST_RATE_BUY_RAW else None
+    _COST_RATE_SELL_RAW = os.getenv("COST_RATE_SELL", "").strip()
+    COST_RATE_SELL = float(_COST_RATE_SELL_RAW) if _COST_RATE_SELL_RAW else None
     SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0001"))
     SLIPPAGE_IMPACT = float(os.getenv("SLIPPAGE_IMPACT", "0.0"))
     ALLOW_SHORT = os.getenv("ALLOW_SHORT", "0") == "1"
@@ -27,6 +81,10 @@ class ModelConfig:
     ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", _DEFAULT_ANN))
     # Price-limit (涨跌停) detection tolerance
     CN_LIMIT_HIT_TOL = float(os.getenv("CN_LIMIT_HIT_TOL", "0.001"))
+    CN_TICK_SIZE = float(os.getenv("CN_TICK_SIZE", "0.01"))
+    CN_LOT_SIZE = int(os.getenv("CN_LOT_SIZE", "100"))
+    # Tax/fee asymmetry (generic; instrument-specific exemptions require metadata)
+    CN_STAMP_TAX_RATE = float(os.getenv("CN_STAMP_TAX_RATE", "0.0"))
     # Optional CSV for listing-day / special limit exemptions:
     # code,start_date[,end_date]
     CN_LIMIT_EXEMPT_FILE = os.getenv("CN_LIMIT_EXEMPT_FILE", "")
@@ -39,12 +97,27 @@ class ModelConfig:
     CN_MINUTE_END_DATE = os.getenv("CN_MINUTE_END_DATE", "")
     CN_SIGNAL_TIME = os.getenv("CN_SIGNAL_TIME", "10:00")
     CN_EXIT_TIME = os.getenv("CN_EXIT_TIME", "15:00")
+    # Trading time filter (1min bars). When enabled, bars outside continuous trading
+    # hours are treated as non-tradable.
+    CN_ENFORCE_TRADING_HOURS = os.getenv("CN_ENFORCE_TRADING_HOURS", "1") == "1"
+    # Tradable inference from minute OHLCV (volume/amount == 0 treated as non-tradable).
+    CN_TRADABLE_REQUIRE_LIQUIDITY = os.getenv("CN_TRADABLE_REQUIRE_LIQUIDITY", "1") == "1"
+    # Liquidity/partial-fill constraints (approximate). Uses participation rate × volume.
+    CN_ENABLE_LIQUIDITY_CONSTRAINTS = os.getenv("CN_ENABLE_LIQUIDITY_CONSTRAINTS", "0") == "1"
+    CN_LIQUIDITY_PARTICIPATION_RATE = float(os.getenv("CN_LIQUIDITY_PARTICIPATION_RATE", "0.05"))
+    # Additional slippage term based on trade size / bar volume:
+    # slip += turnover * CN_VOLUME_IMPACT * (trade_shares / volume) ** CN_VOLUME_IMPACT_ALPHA
+    CN_VOLUME_IMPACT = float(os.getenv("CN_VOLUME_IMPACT", "0.0"))
+    CN_VOLUME_IMPACT_ALPHA = float(os.getenv("CN_VOLUME_IMPACT_ALPHA", "0.5"))
     # Execution rule controls:
     # - CN_ENFORCE_T_PLUS_ONE=1 applies same-day sell blocking by default.
     # - CN_T0_ALLOWED_CODES can whitelist symbols that are allowed to sell intraday.
     CN_ENFORCE_T_PLUS_ONE = os.getenv("CN_ENFORCE_T_PLUS_ONE", "1") == "1"
+    CN_T0_ALLOWED_CODES_FILE = os.getenv("CN_T0_ALLOWED_CODES_FILE", "cn_t0_allowed_codes.csv").strip()
     _CN_T0_ALLOWED_CODES_RAW = os.getenv("CN_T0_ALLOWED_CODES", "")
-    CN_T0_ALLOWED_CODES = [c.strip() for c in _CN_T0_ALLOWED_CODES_RAW.split(",") if c.strip()]
+    CN_T0_ALLOWED_CODES = _parse_code_list(_CN_T0_ALLOWED_CODES_RAW)
+    if not CN_T0_ALLOWED_CODES:
+        CN_T0_ALLOWED_CODES = _load_codes_from_csv(CN_T0_ALLOWED_CODES_FILE)
     # Decision frequency:
     # - daily: aggregate minute data to one bar per day.
     # - 1min: keep minute bars as the decision timeline.

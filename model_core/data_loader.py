@@ -54,6 +54,7 @@ class ChinaMinuteDataLoader:
         self.code_alias_map = load_code_alias_map(alias_path)
         self._warned_missing_adj: set[str] = set()
         self._warned_alias_adj: set[str] = set()
+        self._warned_empty_t0_whitelist = False
 
     def _parse_time(self, value: str) -> Optional[time]:
         if not value:
@@ -504,6 +505,14 @@ class ChinaMinuteDataLoader:
         if minute_df.empty:
             return minute_df
 
+        if ModelConfig.CN_ENFORCE_TRADING_HOURS:
+            minutes = minute_df["trade_time"].dt.hour * 60 + minute_df["trade_time"].dt.minute
+            morning = (minutes >= 9 * 60 + 30) & (minutes <= 11 * 60 + 30)
+            afternoon = (minutes >= 13 * 60) & (minutes <= 15 * 60)
+            minute_df = minute_df[morning | afternoon]
+            if minute_df.empty:
+                return minute_df
+
         if start_dt is not None:
             minute_df = minute_df[minute_df["trade_time"] >= start_dt]
         if end_dt_exclusive is not None:
@@ -568,6 +577,12 @@ class ChinaMinuteDataLoader:
                 frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
+            if ModelConfig.CN_TRADABLE_REQUIRE_LIQUIDITY and {"volume", "amount"}.issubset(frame.columns):
+                volume = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+                amount = pd.to_numeric(frame["amount"], errors="coerce").fillna(0.0)
+                frame["tradable"] = ((volume > 0.0) | (amount > 0.0)).astype("float64")
+            else:
+                frame["tradable"] = 1.0
             if target_ret_mode == "close_to_close":
                 if decision_freq == "1min":
                     # Compute minute target_ret later on the unified timeline so hold_bars
@@ -617,7 +632,10 @@ class ChinaMinuteDataLoader:
             series_list = []
             for code, frame in per_code_frames.items():
                 if field == "tradable":
-                    s = pd.Series(1.0, index=frame[index_col], name=code)
+                    if "tradable" in frame.columns:
+                        s = frame.set_index(index_col)["tradable"].rename(code)
+                    else:
+                        s = pd.Series(1.0, index=frame[index_col], name=code)
                 else:
                     s = frame.set_index(index_col)[field].rename(code)
                 series_list.append(s)
@@ -695,6 +713,17 @@ class ChinaMinuteDataLoader:
         decision_freq: str,
     ) -> None:
         rules = ChinaMarketRules.from_config()
+        if (
+            rules.enforce_t_plus_one
+            and not rules.t0_allowed_codes
+            and not self._warned_empty_t0_whitelist
+        ):
+            print(
+                "[rules] No T+0 whitelist codes loaded "
+                "(checked CN_T0_ALLOWED_CODES and CN_T0_ALLOWED_CODES_FILE); "
+                "using stock-style simplification (all symbols treated as T+1)."
+            )
+            self._warned_empty_t0_whitelist = True
         session_ids = rules.build_session_id_matrix(
             dates=index,
             num_assets=len(symbols),
@@ -729,6 +758,16 @@ class ChinaMinuteDataLoader:
         )
         raw_data_cache["limit_up"] = limit_up.float()
         raw_data_cache["limit_down"] = limit_down.float()
+
+        if ModelConfig.CN_ENABLE_LIQUIDITY_CONSTRAINTS:
+            volume = raw_data_cache.get("volume")
+            if volume is not None:
+                part = float(ModelConfig.CN_LIQUIDITY_PARTICIPATION_RATE)
+                lot = max(1.0, float(ModelConfig.CN_LOT_SIZE))
+                max_trade = torch.nan_to_num(volume * part / lot, nan=0.0, posinf=0.0, neginf=0.0)
+                if "tradable" in raw_data_cache:
+                    max_trade = max_trade * (raw_data_cache["tradable"] > 0).float()
+                raw_data_cache["max_trade"] = max_trade
 
     def _build_limit_exempt_matrix(
         self,

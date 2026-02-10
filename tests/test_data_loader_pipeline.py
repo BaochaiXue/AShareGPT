@@ -283,6 +283,59 @@ def test_minute_decision_frequency_uses_minute_timeline_and_hold_bars(
     assert torch.all(loader.raw_data_cache["tradable"][0] == 1.0).item()
 
 
+def test_tradable_inferred_from_nonzero_volume_or_amount(tmp_path: Path, monkeypatch) -> None:
+    _base_config(monkeypatch)
+    monkeypatch.setattr(ModelConfig, "CN_DECISION_FREQ", "1min")
+    monkeypatch.setattr(ModelConfig, "CN_HOLD_BARS", 1)
+    monkeypatch.setattr(ModelConfig, "CN_TRAIN_RATIO", 1.0)
+    monkeypatch.setattr(ModelConfig, "CN_VAL_RATIO", 0.0)
+    monkeypatch.setattr(ModelConfig, "CN_TRADABLE_REQUIRE_LIQUIDITY", True)
+
+    rows = [
+        {"trade_time": "2024-01-02 09:30:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 10.0, "amount": 100.0},
+        {"trade_time": "2024-01-02 09:31:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 0.0, "amount": 0.0},
+        {"trade_time": "2024-01-02 09:32:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 5.0, "amount": 50.0},
+    ]
+    _write_minute_csv(tmp_path / "2024" / "000001.csv", rows)
+
+    loader = ChinaMinuteDataLoader(data_root=str(tmp_path))
+    loader.load_data(codes=["000001"], years=[2024])
+
+    assert loader.raw_data_cache is not None
+    assert torch.allclose(
+        loader.raw_data_cache["tradable"][0].cpu(),
+        torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32),
+    )
+
+
+def test_loader_populates_max_trade_matrix_when_enabled(tmp_path: Path, monkeypatch) -> None:
+    _base_config(monkeypatch)
+    monkeypatch.setattr(ModelConfig, "CN_DECISION_FREQ", "1min")
+    monkeypatch.setattr(ModelConfig, "CN_HOLD_BARS", 1)
+    monkeypatch.setattr(ModelConfig, "CN_TRAIN_RATIO", 1.0)
+    monkeypatch.setattr(ModelConfig, "CN_VAL_RATIO", 0.0)
+    monkeypatch.setattr(ModelConfig, "CN_ENABLE_LIQUIDITY_CONSTRAINTS", True)
+    monkeypatch.setattr(ModelConfig, "CN_LIQUIDITY_PARTICIPATION_RATE", 0.1)
+    monkeypatch.setattr(ModelConfig, "CN_LOT_SIZE", 100)
+
+    rows = [
+        {"trade_time": "2024-01-02 09:30:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 1000.0, "amount": 10000.0},
+        {"trade_time": "2024-01-02 09:31:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 0.0, "amount": 0.0},
+    ]
+    _write_minute_csv(tmp_path / "2024" / "000001.csv", rows)
+
+    loader = ChinaMinuteDataLoader(data_root=str(tmp_path))
+    loader.load_data(codes=["000001"], years=[2024])
+
+    assert loader.raw_data_cache is not None
+    assert "max_trade" in loader.raw_data_cache
+    # max_trade = volume * part / lot, and should be masked by tradable.
+    assert torch.allclose(
+        loader.raw_data_cache["max_trade"][0].cpu(),
+        torch.tensor([1.0, 0.0], dtype=torch.float32),
+    )
+
+
 def test_minute_target_alignment_uses_past_bars_not_future(tmp_path: Path, monkeypatch) -> None:
     _base_config(monkeypatch)
     monkeypatch.setattr(ModelConfig, "CN_DECISION_FREQ", "1min")

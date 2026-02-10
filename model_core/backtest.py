@@ -35,8 +35,14 @@ class ChinaBacktest:
 
     def __init__(self):
         self.cost_rate = ModelConfig.COST_RATE
+        self.buy_cost_rate = ModelConfig.COST_RATE_BUY
+        self.sell_cost_rate = ModelConfig.COST_RATE_SELL
+        self.stamp_tax_rate = ModelConfig.CN_STAMP_TAX_RATE
         self.slippage_rate = ModelConfig.SLIPPAGE_RATE
         self.slippage_impact = ModelConfig.SLIPPAGE_IMPACT
+        self.volume_impact = ModelConfig.CN_VOLUME_IMPACT
+        self.volume_impact_alpha = ModelConfig.CN_VOLUME_IMPACT_ALPHA
+        self.lot_size = max(1.0, float(ModelConfig.CN_LOT_SIZE))
         self.allow_short = ModelConfig.ALLOW_SHORT
         self.signal_lag = max(0, ModelConfig.SIGNAL_LAG)
         self.annualization_factor = max(1, ModelConfig.ANNUALIZATION_FACTOR)
@@ -46,7 +52,7 @@ class ChinaBacktest:
         turnover: torch.Tensor,
         raw_data: Optional[dict[str, torch.Tensor]],
     ) -> torch.Tensor:
-        if (self.slippage_rate <= 0) and (self.slippage_impact <= 0):
+        if (self.slippage_rate <= 0) and (self.slippage_impact <= 0) and (self.volume_impact <= 0):
             return torch.zeros_like(turnover)
 
         slip = turnover * self.slippage_rate
@@ -59,6 +65,14 @@ class ChinaBacktest:
             # Missing OHLC should not poison pnl with NaN slippage.
             hl_range = torch.nan_to_num(hl_range, nan=0.0, posinf=0.0, neginf=0.0)
             slip = slip + turnover * self.slippage_impact * hl_range
+
+        if self.volume_impact > 0 and raw_data and "volume" in raw_data:
+            volume = torch.nan_to_num(raw_data["volume"].abs(), nan=0.0, posinf=0.0, neginf=0.0)
+            trade_shares = turnover * float(self.lot_size)
+            ratio = trade_shares / (volume + 1e-6)
+            ratio = torch.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
+            alpha = max(0.0, float(self.volume_impact_alpha))
+            slip = slip + turnover * float(self.volume_impact) * torch.pow(ratio, alpha)
         return torch.nan_to_num(slip, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _compute_risk_metrics(
@@ -193,9 +207,14 @@ class ChinaBacktest:
         # Price-limit masks
         limit_up = None
         limit_down = None
+        max_trade = None
         if raw_data is not None:
             limit_up = raw_data.get("limit_up")
             limit_down = raw_data.get("limit_down")
+            max_trade = raw_data.get("max_trade")
+
+        if max_trade is not None and max_trade.shape != desired_position.shape:
+            raise ValueError("raw_data['max_trade'] must match signal shape [assets, time].")
 
         if t_plus_one_required is None and sell_block is not None:
             per_asset_required = (sell_block.max(dim=1, keepdim=True).values > 0).float()
@@ -252,6 +271,13 @@ class ChinaBacktest:
                 sell_decrease = desired_t < prev_pos
                 desired_t = torch.where(dn_hit & sell_decrease, prev_pos, desired_t)
 
+            # --- Liquidity constraint (approximate partial fills) ---
+            if max_trade is not None:
+                max_step = torch.clamp(max_trade[:, t], min=0.0)
+                delta = desired_t - prev_pos
+                delta = torch.clamp(delta, min=-max_step, max=max_step)
+                desired_t = prev_pos + delta
+
             current_pos = torch.where(tradable_t, desired_t, prev_pos)
 
             buy_increase = torch.clamp(current_pos - prev_pos, min=0.0)
@@ -280,9 +306,18 @@ class ChinaBacktest:
         raw_data: dict[str, torch.Tensor],
         has_return_f: torch.Tensor,
     ) -> torch.Tensor:
+        prev_pos = torch.roll(position, 1, dims=1)
+        prev_pos[:, 0] = 0.0
+        buy_turnover = torch.clamp(position - prev_pos, min=0.0)
+        sell_turnover = torch.clamp(prev_pos - position, min=0.0)
+
+        buy_rate = self.buy_cost_rate if self.buy_cost_rate is not None else self.cost_rate
+        sell_rate = self.sell_cost_rate if self.sell_cost_rate is not None else self.cost_rate
+        fees = buy_turnover * buy_rate + sell_turnover * (sell_rate + self.stamp_tax_rate)
+
         slippage = self._compute_slippage(turnover, raw_data)
         safe_target = torch.nan_to_num(target_ret, nan=0.0, posinf=0.0, neginf=0.0)
-        pnl = position * safe_target - turnover * self.cost_rate - slippage
+        pnl = position * safe_target - fees - slippage
         return pnl * has_return_f
 
     def _build_trading_path(
