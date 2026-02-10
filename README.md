@@ -189,7 +189,7 @@ All settings are driven by environment variables (see `.env.example` for the ful
 Some A-share rules require **instrument metadata** (security type, ST flag, listing date, trading-status flags) or **L2/LOB** data. With minute OHLCV only, AShareGPT uses the following simplifications:
 
 - **ST/*ST 5% price limit**: not detected automatically. ST stocks are treated as normal board codes (i.e. code-prefix-based limits only).
-- **ETF vs Stock differences**: only modeled via whitelist (T+0 vs T+1). This repo ships a snapshot file `cn_t0_allowed_codes.csv` (SSE ETF category + SZSE ETF list, fetched on 2026-02-10), loaded by default through `CN_T0_ALLOWED_CODES_FILE`. If env+file yield no codes, it falls back to stock-style simplification (all symbols treated as T+1). Fees/taxes are not instrument-type aware unless you run separate universes or keep `CN_STAMP_TAX_RATE=0`.
+- **ETF vs Stock differences**: only modeled via whitelist (T+0 vs T+1). This repo ships a snapshot file `cn_t0_allowed_codes.csv` built from `sse_intraday_turnover_funds.xls` and `szse_intraday_turnover_funds.xlsx` (fetched on 2026-02-10), loaded by default through `CN_T0_ALLOWED_CODES_FILE`. If env+file yield no codes, it falls back to stock-style simplification (all symbols treated as T+1). Fees/taxes are not instrument-type aware unless you run separate universes or keep `CN_STAMP_TAX_RATE=0`.
 - **New listing / special IPO limit rules**: not inferred from listing dates. If needed, provide `CN_LIMIT_EXEMPT_FILE` to exempt known date ranges.
 - **Order book / queueing / limit-up封单**: not modeled. Instead, you can optionally enable an approximate execution cap (`CN_ENABLE_LIQUIDITY_CONSTRAINTS=1`) and volume-based impact (`CN_VOLUME_IMPACT>0`) to reduce “ideal fills”.
 
