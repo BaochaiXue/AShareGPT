@@ -50,7 +50,7 @@ def normalize_date(value: str) -> str:
             return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y%m%d")
         except ValueError:
             pass
-    return text
+    raise ValueError(f"Cannot parse date: {text!r}")
 
 
 def is_header(row: List[str]) -> bool:
@@ -105,7 +105,11 @@ def process_file(path: Path, dry_run: bool) -> FileStats:
             stats.invalid_rows += 1
             continue
 
-        date = normalize_date(date_raw)
+        try:
+            date = normalize_date(date_raw)
+        except ValueError:
+            stats.invalid_rows += 1
+            continue
         if prev_date is not None and date < prev_date:
             stats.order_issues += 1
         prev_date = date
@@ -279,7 +283,7 @@ dependencies:
       - -r requirements.txt
 ```
 
-genearte_all_code.py
+generate_all_code.py
 ```python
 #!/usr/bin/env python3
 """Generate a Markdown snapshot of all Python, YAML, and shell source files."""
@@ -320,7 +324,7 @@ SUFFIX_TO_LANG: dict[str, str] = {
 
 
 def collect_files(root: Path, suffixes: Iterable[str], ignore_dirs: Sequence[str]) -> list[Path]:
-    """Return all files under root that match the specified suffixes while respecting the ignore list."""
+    """Return all files under root that match suffixes while respecting ignore directories."""
     suffix_set: set[str] = {suffix.lower() for suffix in suffixes}
     ignore_set: set[str] = set(ignore_dirs)
     matches: list[Path] = []
@@ -340,7 +344,7 @@ def collect_files(root: Path, suffixes: Iterable[str], ignore_dirs: Sequence[str
 
 
 def write_markdown(files: Iterable[Path], root: Path, output_path: Path) -> None:
-    """Write a Markdown file containing each source file surrounded by fenced code blocks."""
+    """Write a Markdown file containing each source file in fenced code blocks."""
     root = root.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -394,6 +398,109 @@ if __name__ == "__main__":
 model_core/__init__.py
 ```python
 """AShareGPT core package (A-share minute CSV only)."""
+```
+
+model_core/application/__init__.py
+```python
+"""Compatibility application package."""
+
+```
+
+model_core/application/services/__init__.py
+```python
+"""Compatibility service exports."""
+
+from .ppo_training_service import PpoTrainingService, TrainingRunState
+
+__all__ = ["PpoTrainingService", "TrainingRunState"]
+
+```
+
+model_core/application/services/ppo_training_service.py
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+import torch
+
+from model_core.training import _PpoLoop
+
+
+@dataclass
+class TrainingRunState:
+    """Compatibility training output for callers expecting the legacy service."""
+
+    best_score: float
+    best_formula: Optional[list[int]]
+    history: dict[str, list[Any]]
+
+
+class PpoTrainingService:
+    """Compatibility wrapper over the unified PPO loop implementation."""
+
+    def __init__(
+        self,
+        *,
+        model,
+        optimizer,
+        bos_id: int,
+        token_arity: torch.Tensor,
+        token_delta: torch.Tensor,
+        device: torch.device,
+        reward_orchestrator,
+        use_lord: bool = False,
+        lord_opt=None,
+    ):
+        self._loop = _PpoLoop(
+            model=model,
+            optimizer=optimizer,
+            bos_id=bos_id,
+            token_arity=token_arity,
+            token_delta=token_delta,
+            device=device,
+            reward_orch=reward_orchestrator,
+            use_lord=use_lord,
+            lord_opt=lord_opt,
+        )
+
+    def train(
+        self,
+        *,
+        full_feat: torch.Tensor,
+        train_steps: int,
+        batch_size: int,
+        max_formula_len: int,
+        ppo_epochs: int,
+        ppo_clip_eps: float,
+        ppo_value_coef: float,
+        ppo_entropy_coef: float,
+        ppo_max_grad_norm: float,
+        rank_monitor=None,
+        rank_every: int = 100,
+        on_new_best: Optional[Callable[[float, float, list[int]], None]] = None,
+    ) -> TrainingRunState:
+        best_score, best_formula, history = self._loop.run(
+            full_feat=full_feat,
+            train_steps=train_steps,
+            batch_size=batch_size,
+            max_len=max_formula_len,
+            ppo_epochs=ppo_epochs,
+            clip_eps=ppo_clip_eps,
+            value_coef=ppo_value_coef,
+            entropy_coef=ppo_entropy_coef,
+            max_grad_norm=ppo_max_grad_norm,
+            rank_monitor=rank_monitor,
+            rank_every=rank_every,
+            on_new_best=on_new_best,
+        )
+        return TrainingRunState(
+            best_score=float(best_score),
+            best_formula=best_formula,
+            history=history,
+        )
+
 ```
 
 model_core/backtest.py
@@ -603,7 +710,18 @@ class ChinaBacktest:
         if t_plus_one_required is None:
             t_plus_one_required = torch.zeros_like(desired_position)
         if session_id is None:
-            session_id = torch.zeros_like(desired_position)
+            if sell_block is not None:
+                # Explicit sell-block inputs are interpreted as same-session flags unless caller
+                # provides per-bar session ids.
+                session_id = torch.zeros_like(desired_position)
+            else:
+                # Default: each bar = unique session → locked_buy resets every step.
+                # Safest fallback when caller doesn't provide session info.
+                session_id = torch.arange(
+                    desired_position.shape[1],
+                    dtype=desired_position.dtype,
+                    device=desired_position.device,
+                ).unsqueeze(0).expand_as(desired_position)
 
         prev_session = session_id[:, 0].clone()
 
@@ -843,12 +961,15 @@ class ModelConfig:
     SLIPPAGE_IMPACT = float(os.getenv("SLIPPAGE_IMPACT", "0.0"))
     ALLOW_SHORT = os.getenv("ALLOW_SHORT", "0") == "1"
     SIGNAL_LAG = int(os.getenv("CN_SIGNAL_LAG", "1"))
-    # Annualization: auto-compute for 1min (240 bars/day * 240 trading days)
+    # Annualization: auto-compute for 1min (240 bars/day * 252 trading days)
     _CN_DECISION_FREQ_RAW = os.getenv("CN_DECISION_FREQ", "daily").strip().lower()
-    _DEFAULT_ANN = "57600" if _CN_DECISION_FREQ_RAW == "1min" else "252"
+    _DEFAULT_ANN = "60480" if _CN_DECISION_FREQ_RAW == "1min" else "252"
     ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", _DEFAULT_ANN))
     # Price-limit (涨跌停) detection tolerance
     CN_LIMIT_HIT_TOL = float(os.getenv("CN_LIMIT_HIT_TOL", "0.001"))
+    # Optional CSV for listing-day / special limit exemptions:
+    # code,start_date[,end_date]
+    CN_LIMIT_EXEMPT_FILE = os.getenv("CN_LIMIT_EXEMPT_FILE", "")
     STRATEGY_FILE = os.getenv("STRATEGY_FILE", "best_cn_strategy.json")
     CN_MINUTE_DATA_ROOT = os.getenv("CN_MINUTE_DATA_ROOT", "data")
     CN_USE_ADJ_FACTOR = os.getenv("CN_USE_ADJ_FACTOR", "1") == "1"
@@ -910,6 +1031,7 @@ model_core/data/__init__.py
 from .io import (
     DEFAULT_ENCODINGS,
     atomic_write_csv,
+    normalize_code_column,
     read_csv_any_encoding,
     read_last_row_token,
     safe_to_datetime,
@@ -919,6 +1041,7 @@ from .io import (
 __all__ = [
     "DEFAULT_ENCODINGS",
     "atomic_write_csv",
+    "normalize_code_column",
     "read_csv_any_encoding",
     "read_last_row_token",
     "safe_to_datetime",
@@ -937,6 +1060,7 @@ from typing import Any, Iterable, Optional
 import pandas as pd
 
 DEFAULT_ENCODINGS: tuple[str, ...] = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+_RETRYABLE_CSV_ERRORS = (UnicodeDecodeError, UnicodeError, pd.errors.ParserError)
 
 
 def read_csv_any_encoding(
@@ -953,7 +1077,7 @@ def read_csv_any_encoding(
     for encoding in encodings:
         try:
             return pd.read_csv(path, usecols=usecols, dtype=dtype, encoding=encoding, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - fallback reader intentionally retries broadly
+        except _RETRYABLE_CSV_ERRORS as exc:
             last_err = exc
     if last_err is not None:
         raise last_err
@@ -973,6 +1097,34 @@ def safe_to_numeric(series: pd.Series) -> pd.Series:
     """Convert to numeric with invalid values coerced to NaN."""
 
     return pd.to_numeric(series, errors="coerce")
+
+
+def normalize_code_column(
+    df: pd.DataFrame,
+    *,
+    code_col: str = "code",
+    alias_col: str = "证券代码",
+    fillna_from_alias: bool = False,
+) -> pd.DataFrame:
+    """Normalize security code columns to a canonical ``code`` column.
+
+    Behavior mirrors existing scripts:
+    - If ``code`` is absent but alias exists, rename alias -> code.
+    - If both exist and ``fillna_from_alias`` is True, fill missing code values.
+    - Otherwise, leave the frame unchanged.
+    """
+
+    has_code = code_col in df.columns
+    has_alias = alias_col in df.columns
+
+    if not has_code and has_alias:
+        df = df.rename(columns={alias_col: code_col})
+        has_code = True
+
+    if has_code and has_alias and fillna_from_alias:
+        df[code_col] = df[code_col].fillna(df[alias_col])
+
+    return df
 
 
 def atomic_write_csv(path: Path, df: pd.DataFrame, *, index: bool = False, **kwargs: Any) -> None:
@@ -1117,6 +1269,14 @@ class ChinaMinuteDataLoader:
             return mode, hold_bars
 
         if mode == "signal_to_exit":
+            # signal_to_exit = buy & sell same day → violates T+1 for stocks
+            rules = ChinaMarketRules.from_config()
+            if rules.enforce_t_plus_one:
+                raise ValueError(
+                    "CN_TARGET_RET_MODE='signal_to_exit' with CN_DECISION_FREQ='daily' "
+                    "is incompatible with T+1 settlement.  Use 'close_to_close' or "
+                    "disable T+1 via CN_ENFORCE_T_PLUS_ONE=0."
+                )
             return mode, 0
 
         hold_days = int(ModelConfig.CN_HOLD_DAYS)
@@ -1213,10 +1373,20 @@ class ChinaMinuteDataLoader:
         if adj is None or adj.empty:
             frame["adj_factor"] = 1.0
             return frame
-        merged = frame.merge(adj, on="date", how="left").sort_values("date")
+        merged = frame.merge(adj, on="date", how="left")
+        if "trade_time" in merged.columns:
+            merged = merged.sort_values("trade_time")
+        else:
+            merged = merged.sort_values("date")
         merged["adj_factor"] = merged["adj_factor"].ffill().fillna(1.0)
+        safe_adj = merged["adj_factor"].astype("float64").replace(0.0, 1.0)
         for col in ("open", "high", "low", "close"):
-            merged[col] = merged[col].astype("float64") * merged["adj_factor"]
+            merged[col] = merged[col].astype("float64") * safe_adj
+        # Keep turnover-related features on the same split-adjusted scale as prices.
+        if "volume" in merged.columns:
+            merged["volume"] = (
+                merged["volume"].astype("float64") / safe_adj
+            ).replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
         return merged
 
     def _resolve_split_sizes(self, total_len: int) -> tuple[int, int, int]:
@@ -1514,39 +1684,6 @@ class ChinaMinuteDataLoader:
         minute_df["date"] = minute_df["trade_time"].dt.normalize()
         return minute_df
 
-    def _load_minute_records_for_code(
-        self,
-        *,
-        code: str,
-        years: list[int],
-        start_dt: Optional[pd.Timestamp],
-        end_dt: Optional[pd.Timestamp],
-        end_dt_exclusive: Optional[pd.Timestamp],
-    ) -> list[dict[str, float | pd.Timestamp]]:
-        minute_df = self._load_minute_frame_for_code(
-            code=code,
-            years=years,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            end_dt_exclusive=end_dt_exclusive,
-        )
-        if minute_df.empty:
-            return []
-
-        return [
-            {
-                "trade_time": row.trade_time,
-                "date": row.date,
-                "open": float(row.open),
-                "high": float(row.high),
-                "low": float(row.low),
-                "close": float(row.close),
-                "volume": float(row.vol),
-                "amount": float(row.amount),
-            }
-            for row in minute_df.itertuples(index=False)
-        ]
-
     def _build_per_code_frames(
         self,
         *,
@@ -1565,13 +1702,18 @@ class ChinaMinuteDataLoader:
         per_code_frames: dict[str, pd.DataFrame] = {}
         for code in codes:
             if decision_freq == "1min":
-                records = self._load_minute_records_for_code(
+                frame = self._load_minute_frame_for_code(
                     code=code,
                     years=years,
                     start_dt=start_dt,
                     end_dt=end_dt,
                     end_dt_exclusive=end_dt_exclusive,
                 )
+                if frame.empty:
+                    continue
+                frame = frame.rename(columns={"vol": "volume"}).loc[
+                    :, ["trade_time", "date", "open", "high", "low", "close", "volume", "amount"]
+                ]
             else:
                 records = self._load_daily_records_for_code(
                     code=code,
@@ -1584,17 +1726,19 @@ class ChinaMinuteDataLoader:
                     bar_style=bar_style,
                     target_ret_mode=target_ret_mode,
                 )
-            if not records:
-                continue
-            frame = pd.DataFrame(records)
-            if decision_freq == "1min":
-                frame = frame.drop_duplicates(subset=["trade_time"], keep="last").sort_values("trade_time")
-            else:
+                if not records:
+                    continue
+                frame = pd.DataFrame(records)
                 frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date")
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
             if target_ret_mode == "close_to_close":
-                frame["target_ret"] = (frame["close"] / frame["close"].shift(hold_days)) - 1.0
+                if decision_freq == "1min":
+                    # Compute minute target_ret later on the unified timeline so hold_bars
+                    # is counted in decision bars (including missing minutes), not just raw rows.
+                    frame["target_ret"] = float("nan")
+                else:
+                    frame["target_ret"] = (frame["close"] / frame["close"].shift(hold_days)) - 1.0
             per_code_frames[code] = frame
         return per_code_frames
 
@@ -1624,6 +1768,9 @@ class ChinaMinuteDataLoader:
         per_code_frames: dict[str, pd.DataFrame],
         *,
         index_col: str = "date",
+        decision_freq: str = "daily",
+        target_ret_mode: str = "close_to_close",
+        hold_period: int = 1,
     ) -> dict[str, pd.DataFrame]:
         def build_pivot(
             field: str,
@@ -1645,11 +1792,12 @@ class ChinaMinuteDataLoader:
                 pivot = pivot.fillna(fill_value)
             return pivot
 
+        price_ffill = decision_freq != "1min"
         pivot_specs: dict[str, tuple[bool, Optional[float]]] = {
-            "open": (True, None),
-            "high": (True, None),
-            "low": (True, None),
-            "close": (True, None),
+            "open": (price_ffill, None),
+            "high": (price_ffill, None),
+            "low": (price_ffill, None),
+            "close": (price_ffill, None),
             "volume": (False, 0.0),
             "amount": (False, 0.0),
             "target_ret": (False, None),
@@ -1661,6 +1809,8 @@ class ChinaMinuteDataLoader:
         }
         if ModelConfig.CN_USE_ADJ_FACTOR:
             pivots["adj_factor"] = build_pivot("adj_factor", ffill=True, fill_value=1.0)
+        if decision_freq == "1min" and target_ret_mode == "close_to_close":
+            pivots["target_ret"] = (pivots["close"] / pivots["close"].shift(hold_period)) - 1.0
         return pivots
 
     @staticmethod
@@ -1728,13 +1878,79 @@ class ChinaMinuteDataLoader:
         raw_data_cache["t_plus_one_required"] = t_plus_one_required
         raw_data_cache["t_plus_one_sell_block"] = t_plus_one_sell_block
 
-        # Price-limit (涨跌停) masks
+        # Price-limit (涨跌停) masks — use prev-day close, not prev-bar
         close = raw_data_cache["close"]
+        prev_day_close = rules.compute_prev_day_close(close, session_ids)
+        raw_data_cache["prev_day_close"] = prev_day_close
+        limit_exempt = self._build_limit_exempt_matrix(index=index, symbols=symbols)
+        if limit_exempt is not None:
+            raw_data_cache["limit_exempt"] = limit_exempt
         limit_up, limit_down = rules.build_limit_hit_masks(
-            close=close, symbols=symbols,
+            close=close,
+            prev_day_close=prev_day_close,
+            symbols=symbols,
+            limit_exempt=limit_exempt,
         )
         raw_data_cache["limit_up"] = limit_up.float()
         raw_data_cache["limit_down"] = limit_down.float()
+
+    def _build_limit_exempt_matrix(
+        self,
+        *,
+        index: pd.DatetimeIndex,
+        symbols: list[str],
+    ) -> Optional[torch.Tensor]:
+        """Optional runtime limit-exempt mask from external CSV.
+
+        CSV schema:
+            code,start_date[,end_date]
+        """
+
+        cfg_path = (ModelConfig.CN_LIMIT_EXEMPT_FILE or "").strip()
+        if not cfg_path:
+            return None
+
+        path = Path(cfg_path)
+        if not path.is_absolute():
+            path = self.data_root.parent / path
+        if not path.exists():
+            return None
+
+        try:
+            df = read_csv_any_encoding(
+                path,
+                usecols=lambda c: c in {"code", "start_date", "end_date"},
+                dtype=str,
+            )
+        except Exception:
+            return None
+        if df.empty or "code" not in df.columns or "start_date" not in df.columns:
+            return None
+
+        def _norm_code(value: str) -> str:
+            return value.strip().upper().split(".")[0]
+
+        out = torch.zeros((len(symbols), len(index)), dtype=torch.float32, device=ModelConfig.DEVICE)
+        session_dates = pd.DatetimeIndex(index.normalize())
+        code_to_rows: dict[str, pd.DataFrame] = {
+            code: frame for code, frame in df.groupby(df["code"].fillna("").map(_norm_code), sort=False)
+        }
+        for i, symbol in enumerate(symbols):
+            rows = code_to_rows.get(_norm_code(symbol))
+            if rows is None or rows.empty:
+                continue
+            for row in rows.itertuples(index=False):
+                start = pd.to_datetime(getattr(row, "start_date", None), errors="coerce")
+                if pd.isna(start):
+                    continue
+                end_raw = getattr(row, "end_date", None)
+                end = pd.to_datetime(end_raw, errors="coerce")
+                if pd.isna(end):
+                    end = start
+                mask = (session_dates >= start.normalize()) & (session_dates <= end.normalize())
+                if mask.any():
+                    out[i, mask] = 1.0
+        return out
 
     def load_data(
         self,
@@ -1779,7 +1995,13 @@ class ChinaMinuteDataLoader:
 
         self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt, decision_freq=decision_freq)
         index_col = "trade_time" if decision_freq == "1min" else "date"
-        pivots = self._build_pivots(per_code_frames, index_col=index_col)
+        pivots = self._build_pivots(
+            per_code_frames,
+            index_col=index_col,
+            decision_freq=decision_freq,
+            target_ret_mode=target_ret_mode,
+            hold_period=hold_period,
+        )
 
         index = pivots["close"].index
         columns = pivots["close"].columns
@@ -1907,6 +2129,34 @@ class FeatureEngineer:
         return torch.clamp(norm, -clip, clip)
 
     @staticmethod
+    def _get_col_values(
+        df: pd.DataFrame,
+        name_patterns: list[str],
+        *,
+        asset_idx: int,
+        strict_indicator_mapping: bool,
+        missing_indicator_patterns: set[str],
+        fallback_values,
+    ):
+        """Return an indicator column by exact/prefix match with optional strictness."""
+        for pat in name_patterns:
+            if pat in df.columns:
+                return df[pat].values
+        for col in df.columns:
+            for pat in name_patterns:
+                if col.startswith(pat):
+                    return df[col].values
+
+        pattern_desc = " | ".join(name_patterns)
+        if strict_indicator_mapping:
+            raise ValueError(
+                f"Missing indicator mapping [{pattern_desc}] for asset index {asset_idx}. "
+                "Set CN_STRICT_FEATURE_INDICATORS=0 to downgrade to zero-fallback."
+            )
+        missing_indicator_patterns.add(pattern_desc)
+        return fallback_values * 0
+
+    @staticmethod
     def compute_features(
         raw_dict: dict[str, torch.Tensor],
         *,
@@ -2010,6 +2260,15 @@ class FeatureEngineer:
         )
         
         missing_indicator_patterns: set[str] = set()
+        def get_col(df: pd.DataFrame, asset_idx: int, name_patterns: list[str]):
+            return FeatureEngineer._get_col_values(
+                df,
+                name_patterns,
+                asset_idx=asset_idx,
+                strict_indicator_mapping=strict_indicator_mapping,
+                missing_indicator_patterns=missing_indicator_patterns,
+                fallback_values=df["close"].values,
+            )
 
         # Iterate over each asset
         for i in range(n_assets):
@@ -2020,39 +2279,16 @@ class FeatureEngineer:
                 'close': closes[:, i],
                 'volume': volumes[:, i],
             })
-            # Handle zeros in volume to avoid div by zero in some indicators
-            df['volume'] = df['volume'].replace(0, 1e-4)
+            # Keep raw volume for features; use a safe copy for TA indicators.
+            df_safe = df.copy()
+            df_safe['volume'] = df_safe['volume'].replace(0, 1e-4)
             
             # Run Strategy
-            ta_accessor = df.ta
+            ta_accessor = df_safe.ta
             if hasattr(ta_accessor, "cores"):
                 # Avoid multiprocessing path instability across pandas-ta variants.
                 ta_accessor.cores = 0
             ta_accessor.strategy(CustomStrategy)
-            
-            # --- Map implementation output columns to FEATURES list ---
-            # pandas_ta auto-names columns like "RSI_14", "MACD_12_26_9", etc.
-            # We need to map them rigorously.
-            
-            # Helper to safely get col
-            def get_col(name_patterns):
-                # patterns: list of possible names, e.g. ["RSI_14", "RSI"]
-                for pat in name_patterns:
-                    if pat in df.columns:
-                        return df[pat].values
-                # Prefix search
-                for col in df.columns:
-                    for pat in name_patterns:
-                        if col.startswith(pat):
-                            return df[col].values
-                pattern_desc = " | ".join(name_patterns)
-                if strict_indicator_mapping:
-                    raise ValueError(
-                        f"Missing indicator mapping [{pattern_desc}] for asset index {i}. "
-                        "Set CN_STRICT_FEATURE_INDICATORS=0 to downgrade to zero-fallback."
-                    )
-                missing_indicator_patterns.add(pattern_desc)
-                return df['close'].values * 0 # Fallback
             
             # 1. Base Prices
             feat_dict = {}
@@ -2070,73 +2306,74 @@ class FeatureEngineer:
             feat_dict['WCLOSE'] = (df['high'].values + df['low'].values + 2.0 * df['close'].values) / 4.0
             
             # 3. Returns
-            feat_dict['RET'] = get_col(["PCTRET_1"])
-            feat_dict['RET5'] = get_col(["PCTRET_5"])
-            feat_dict['RET10'] = get_col(["PCTRET_10"])
-            feat_dict['RET20'] = get_col(["PCTRET_20"])
-            feat_dict['LOG_RET'] = get_col(["LOGRET_1"])
+            feat_dict['RET'] = get_col(df_safe, i, ["PCTRET_1"])
+            feat_dict['RET5'] = get_col(df_safe, i, ["PCTRET_5"])
+            feat_dict['RET10'] = get_col(df_safe, i, ["PCTRET_10"])
+            feat_dict['RET20'] = get_col(df_safe, i, ["PCTRET_20"])
+            feat_dict['LOG_RET'] = get_col(df_safe, i, ["LOGRET_1"])
             
             # 4. Volatility
-            feat_dict['TR'] = get_col(["TR", "TRUERANGE"])
-            feat_dict['ATR14'] = get_col(["ATR_14", "ATRr_14"])
-            feat_dict['NATR14'] = get_col(["NATR_14"])
+            feat_dict['TR'] = get_col(df_safe, i, ["TR", "TRUERANGE"])
+            feat_dict['ATR14'] = get_col(df_safe, i, ["ATR_14", "ATRr_14"])
+            feat_dict['NATR14'] = get_col(df_safe, i, ["NATR_14"])
             
             # 5. Momentum
-            feat_dict['RSI14'] = get_col(["RSI_14"])
-            feat_dict['RSI24'] = get_col(["RSI_24"])
-            feat_dict['MACD'] = get_col(["MACD_12_26_9"])
-            feat_dict['MACDh'] = get_col(["MACDh_12_26_9"])
-            feat_dict['MACDs'] = get_col(["MACDs_12_26_9"])
-            feat_dict['BOP'] = get_col(["BOP"])
-            feat_dict['CCI14'] = get_col(["CCI_14_0.015"])
-            feat_dict['CMO14'] = get_col(["CMO_14"])
-            feat_dict['KDJ_K'] = get_col(["K_9_3"])
-            feat_dict['KDJ_D'] = get_col(["D_9_3"])
-            feat_dict['KDJ_J'] = get_col(["J_9_3"])
-            feat_dict['MOM10'] = get_col(["MOM_10"])
-            feat_dict['ROC10'] = get_col(["ROC_10"])
-            feat_dict['PPO'] = get_col(["PPO_12_26_9"])
-            feat_dict['PPOh'] = get_col(["PPOh_12_26_9"])
-            feat_dict['PPOs'] = get_col(["PPOs_12_26_9"])
-            feat_dict['TSI'] = get_col(["TSI_13_25_13"])
-            feat_dict['UO'] = get_col(["UO_7_14_28"])
-            feat_dict['WILLR'] = get_col(["WILLR_14"])
+            feat_dict['RSI14'] = get_col(df_safe, i, ["RSI_14"])
+            feat_dict['RSI24'] = get_col(df_safe, i, ["RSI_24"])
+            feat_dict['MACD'] = get_col(df_safe, i, ["MACD_12_26_9"])
+            feat_dict['MACDh'] = get_col(df_safe, i, ["MACDh_12_26_9"])
+            feat_dict['MACDs'] = get_col(df_safe, i, ["MACDs_12_26_9"])
+            feat_dict['BOP'] = get_col(df_safe, i, ["BOP"])
+            feat_dict['CCI14'] = get_col(df_safe, i, ["CCI_14_0.015"])
+            feat_dict['CMO14'] = get_col(df_safe, i, ["CMO_14"])
+            feat_dict['KDJ_K'] = get_col(df_safe, i, ["K_9_3"])
+            feat_dict['KDJ_D'] = get_col(df_safe, i, ["D_9_3"])
+            feat_dict['KDJ_J'] = get_col(df_safe, i, ["J_9_3"])
+            feat_dict['MOM10'] = get_col(df_safe, i, ["MOM_10"])
+            feat_dict['ROC10'] = get_col(df_safe, i, ["ROC_10"])
+            feat_dict['PPO'] = get_col(df_safe, i, ["PPO_12_26_9"])
+            feat_dict['PPOh'] = get_col(df_safe, i, ["PPOh_12_26_9"])
+            feat_dict['PPOs'] = get_col(df_safe, i, ["PPOs_12_26_9"])
+            feat_dict['TSI'] = get_col(df_safe, i, ["TSI_13_25_13"])
+            feat_dict['UO'] = get_col(df_safe, i, ["UO_7_14_28"])
+            feat_dict['WILLR'] = get_col(df_safe, i, ["WILLR_14"])
             
             # 6. Overlap
-            feat_dict['SMA5'] = get_col(["SMA_5"])
-            feat_dict['SMA10'] = get_col(["SMA_10"])
-            feat_dict['SMA20'] = get_col(["SMA_20"])
-            feat_dict['SMA60'] = get_col(["SMA_60"])
-            feat_dict['EMA5'] = get_col(["EMA_5"])
-            feat_dict['EMA10'] = get_col(["EMA_10"])
-            feat_dict['EMA20'] = get_col(["EMA_20"])
-            feat_dict['EMA60'] = get_col(["EMA_60"])
-            feat_dict['TEMA10'] = get_col(["TEMA_10"])
+            feat_dict['SMA5'] = get_col(df_safe, i, ["SMA_5"])
+            feat_dict['SMA10'] = get_col(df_safe, i, ["SMA_10"])
+            feat_dict['SMA20'] = get_col(df_safe, i, ["SMA_20"])
+            feat_dict['SMA60'] = get_col(df_safe, i, ["SMA_60"])
+            feat_dict['EMA5'] = get_col(df_safe, i, ["EMA_5"])
+            feat_dict['EMA10'] = get_col(df_safe, i, ["EMA_10"])
+            feat_dict['EMA20'] = get_col(df_safe, i, ["EMA_20"])
+            feat_dict['EMA60'] = get_col(df_safe, i, ["EMA_60"])
+            feat_dict['TEMA10'] = get_col(df_safe, i, ["TEMA_10"])
             
-            feat_dict['BB_UPPER'] = get_col(["BBU_5_2.0", "BBU_20_2.0"])
-            feat_dict['BB_MID'] = get_col(["BBM_5_2.0", "BBM_20_2.0"])
-            feat_dict['BB_LOWER'] = get_col(["BBL_5_2.0", "BBL_20_2.0"])
-            feat_dict['BB_WIDTH'] = get_col(["BBB_5_2.0", "BBB_20_2.0"])
+            # Strategy requests BBANDS length=20, so map only to 20-bar outputs.
+            feat_dict['BB_UPPER'] = get_col(df_safe, i, ["BBU_20_2.0", "BBU_20_2"])
+            feat_dict['BB_MID'] = get_col(df_safe, i, ["BBM_20_2.0", "BBM_20_2"])
+            feat_dict['BB_LOWER'] = get_col(df_safe, i, ["BBL_20_2.0", "BBL_20_2"])
+            feat_dict['BB_WIDTH'] = get_col(df_safe, i, ["BBB_20_2.0", "BBB_20_2"])
             
-            feat_dict['MIDPOINT'] = get_col(["MIDPOINT_2"])
-            feat_dict['MIDPRICE'] = get_col(["MIDPRICE_2"])
-            if "PSARl_0.02_0.2" in df.columns and "PSARs_0.02_0.2" in df.columns:
-                sar_series = df["PSARl_0.02_0.2"].combine_first(df["PSARs_0.02_0.2"]).fillna(0.0)
+            feat_dict['MIDPOINT'] = get_col(df_safe, i, ["MIDPOINT_2"])
+            feat_dict['MIDPRICE'] = get_col(df_safe, i, ["MIDPRICE_2"])
+            if "PSARl_0.02_0.2" in df_safe.columns and "PSARs_0.02_0.2" in df_safe.columns:
+                sar_series = df_safe["PSARl_0.02_0.2"].combine_first(df_safe["PSARs_0.02_0.2"]).fillna(0.0)
                 feat_dict['SAR'] = sar_series.values
-            elif "PSARl_0.02_0.2" in df.columns:
-                feat_dict['SAR'] = df["PSARl_0.02_0.2"].fillna(0.0).values
-            elif "PSARs_0.02_0.2" in df.columns:
-                feat_dict['SAR'] = df["PSARs_0.02_0.2"].fillna(0.0).values
+            elif "PSARl_0.02_0.2" in df_safe.columns:
+                feat_dict['SAR'] = df_safe["PSARl_0.02_0.2"].fillna(0.0).values
+            elif "PSARs_0.02_0.2" in df_safe.columns:
+                feat_dict['SAR'] = df_safe["PSARs_0.02_0.2"].fillna(0.0).values
             else:
-                feat_dict['SAR'] = get_col(["SAR"])
+                feat_dict['SAR'] = get_col(df_safe, i, ["SAR"])
             
             # 7. Volume
-            feat_dict['OBV'] = get_col(["OBV"])
-            feat_dict['AD'] = get_col(["AD"])
-            feat_dict['ADOSC'] = get_col(["ADOSC_3_10"])
-            feat_dict['CMF'] = get_col(["CMF_20"])
-            typ_price = (df["high"] + df["low"] + df["close"]) / 3.0
-            raw_money = typ_price * df["volume"]
+            feat_dict['OBV'] = get_col(df_safe, i, ["OBV"])
+            feat_dict['AD'] = get_col(df_safe, i, ["AD"])
+            feat_dict['ADOSC'] = get_col(df_safe, i, ["ADOSC_3_10"])
+            feat_dict['CMF'] = get_col(df_safe, i, ["CMF_20"])
+            typ_price = (df_safe["high"] + df_safe["low"] + df_safe["close"]) / 3.0
+            raw_money = typ_price * df_safe["volume"]
             price_delta = typ_price.diff()
             pos_mf = raw_money.where(price_delta > 0, 0.0)
             neg_mf = raw_money.where(price_delta < 0, 0.0).abs()
@@ -2221,21 +2458,28 @@ from model_core.config import ModelConfig
 
 
 def _normalize_code(code: str) -> str:
-    return code.strip().upper()
+    """Normalize to bare code without exchange suffix. '510300.SH' -> '510300'."""
+    return code.strip().upper().split(".")[0]
 
 
 def _limit_pct_for_code(code: str) -> float:
     """Return price limit percentage for a given A-share code.
 
-    主板(SH 60xxxx / SZ 00xxxx):  ±10%
-    创业板(SZ 300xxx):            ±20%
-    科创板(SH 688xxx):            ±20%
-    北交所(BJ 8xxxxx/4xxxxx):     ±30%  (simplified)
+    Main board (SH 60xxxx / SZ 00xxxx): ±10%
+    ChiNext (SZ 300xxx/301xxx):         ±20%
+    STAR (SH 688xxx):                   ±20%
+    BSE (8xxxxx and common NEEQ roots): ±30%
+    Legacy delisted board (400/420):    ±5%
+
+    Note: listing-day no-limit exemptions need external listing metadata and are
+    handled via optional runtime masks, not just code prefix.
     """
-    c = _normalize_code(code).split(".")[0]
-    if c.startswith("300") or c.startswith("688"):
+    c = _normalize_code(code)
+    if c.startswith("400") or c.startswith("420"):
+        return 0.05
+    if c.startswith("300") or c.startswith("301") or c.startswith("688"):
         return 0.20
-    if c.startswith("8") or c.startswith("4"):
+    if c.startswith("8") or c.startswith("43") or c.startswith("83") or c.startswith("87"):
         return 0.30
     return 0.10
 
@@ -2250,7 +2494,7 @@ class ChinaMarketRules:
 
     enforce_t_plus_one: bool
     t0_allowed_codes: frozenset[str]
-    limit_hit_tol: float  # tolerance for limit detection (e.g. 0.001)
+    limit_hit_tol: float
 
     @classmethod
     def from_config(cls) -> "ChinaMarketRules":
@@ -2307,22 +2551,14 @@ class ChinaMarketRules:
     ) -> torch.Tensor:
         """Build sell-block matrix.
 
-        For both daily and 1min freq:
-        - daily:  any bar in the same calendar day as a buy cannot sell (effectively
-                  means you can never sell on the same day you buy — whole row is
-                  within one session).  We mark ALL bars that share a session with
-                  their predecessor so that the backtest engine can block sells on
-                  new-buy bars.
-        - 1min:   within-session bars are blocked; cross-session boundary = new day
-                  = can now sell yesterday's position.
+        - daily:  session changes every bar → same_session is all-zero → no
+                  intra-step block.  The backtest loop itself prevents selling
+                  shares bought in the same step via ``locked_buy``.
+        - 1min:   within-session bars are blocked; cross-session = new day.
         """
         block = torch.zeros_like(t_plus_one_required)
         if t_plus_one_required.numel() == 0:
             return block
-        # For daily freq the session_id changes every row, so same_session is
-        # all-zeros.  That is correct: the backtest engine separately enforces
-        # that we cannot sell on the *buy-bar* itself by checking position
-        # changes within the step.
         same_session = (session_ids[:, 1:] == session_ids[:, :-1]).float()
         block[:, 1:] = same_session * t_plus_one_required[:, 1:]
         return block
@@ -2331,26 +2567,44 @@ class ChinaMarketRules:
     #  Price-limit (涨跌停) matrices
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def compute_prev_day_close(
+        close: torch.Tensor,
+        session_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """For each bar, return the closing price of the *previous* trading day.
+
+        At session boundaries (new day), prev_day_close = close of last bar
+        of the prior session.  Within a session, carry forward.
+        """
+        prev_day = close.clone()
+        prev_day[:, 0] = close[:, 0]  # no prior day → use own close (no limit hit)
+        for t in range(1, close.shape[1]):
+            new_session = session_ids[:, t] != session_ids[:, t - 1]
+            # New session → last bar's close IS the prev-day close
+            # Same session → keep carrying forward
+            prev_day[:, t] = torch.where(new_session, close[:, t - 1], prev_day[:, t - 1])
+        return prev_day
+
     def build_limit_hit_masks(
         self,
         *,
         close: torch.Tensor,
+        prev_day_close: torch.Tensor,
         symbols: list[str],
+        limit_exempt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Detect limit-up and limit-down hits.
 
+        Uses change **relative to previous day's close** (not adjacent bar),
+        matching A-share 涨跌停 definition.
+
         Returns:
-            limit_up:   Bool[assets, time] — 涨停, cannot BUY  (price already at ceiling)
-            limit_down: Bool[assets, time] — 跌停, cannot SELL (price already at floor)
+            limit_up:   Bool[assets, time] — 涨停, cannot BUY
+            limit_down: Bool[assets, time] — 跌停, cannot SELL
         """
-        # pct change vs prev bar
-        prev_close = torch.zeros_like(close)
-        prev_close[:, 1:] = close[:, :-1]
-        prev_close[:, 0] = close[:, 0]  # no change on first bar
+        pct_change = (close - prev_day_close) / (prev_day_close.abs() + 1e-8)
 
-        pct_change = (close - prev_close) / (prev_close.abs() + 1e-8)
-
-        # per-code limit thresholds
         thresholds = torch.tensor(
             [_limit_pct_for_code(s) for s in symbols],
             dtype=close.dtype,
@@ -2361,7 +2615,12 @@ class ChinaMarketRules:
         limit_up = pct_change >= (thresholds - tol)
         limit_down = pct_change <= (-thresholds + tol)
 
-        # First bar is never a limit hit
+        if limit_exempt is not None:
+            exempt = limit_exempt > 0
+            limit_up = limit_up & (~exempt)
+            limit_down = limit_down & (~exempt)
+
+        # First bar of the dataset is never a limit hit
         limit_up[:, 0] = False
         limit_down[:, 0] = False
         return limit_up, limit_down
@@ -2571,8 +2830,6 @@ class LoopedTransformerLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, num_loops: int = 3, dropout: float = 0.1):
         super().__init__()
         self.num_loops = num_loops
-        self.d_model = d_model
-        self.nhead = nhead
 
         # Standard attention components
         self.attention = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
@@ -2734,7 +2991,7 @@ def _ts_delta(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_zscore(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return torch.zeros_like(x)
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     mean = windows.mean(dim=-1)
@@ -2745,7 +3002,7 @@ def _ts_zscore(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_decay_linear(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return x
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     w = torch.arange(1, d + 1, device=x.device, dtype=x.dtype)
@@ -2756,7 +3013,7 @@ def _ts_decay_linear(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_std(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return torch.zeros_like(x)
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     return windows.std(dim=-1, unbiased=False)
@@ -2765,7 +3022,7 @@ def _ts_std(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_rank(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return torch.zeros_like(x)
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     last = windows[:, :, -1].unsqueeze(-1)
@@ -2824,8 +3081,24 @@ def get_ops_config() -> list[tuple[str, Callable[..., torch.Tensor], int]]:
     return OPS_CONFIG_DAILY
 
 
-# Default export for backward compatibility
-OPS_CONFIG = get_ops_config()
+class _OpsConfigProxy:
+    """Backward-compatible dynamic view over `get_ops_config()`."""
+
+    def __iter__(self):
+        return iter(get_ops_config())
+
+    def __len__(self):
+        return len(get_ops_config())
+
+    def __getitem__(self, idx):
+        return get_ops_config()[idx]
+
+    def __repr__(self) -> str:
+        return repr(get_ops_config())
+
+
+# Backward-compatible export that still tracks runtime CN_DECISION_FREQ changes.
+OPS_CONFIG = _OpsConfigProxy()
 ```
 
 model_core/training.py
@@ -3158,27 +3431,28 @@ class _PpoLoop:
         return legal
 
     @staticmethod
+    def _avg_or_nan(values):
+        return sum(values) / len(values) if values else float("nan")
+
+    @staticmethod
     def _record(h, step, best, rewards, ts, vs, pl, vl, ent, sr):
-        def _avg(lst): return sum(lst) / len(lst) if lst else float("nan")
         h["step"].append(step)
         h["avg_reward"].append(float(rewards.mean().item()))
         h["best_score"].append(best)
         h["policy_loss"].append(pl)
         h["value_loss"].append(vl)
         h["entropy"].append(ent)
-        h["avg_train_score"].append(_avg(ts))
-        h["avg_val_score"].append(_avg(vs))
-        if sr is not None:
-            h["stable_rank"].append(sr)
+        h["avg_train_score"].append(_PpoLoop._avg_or_nan(ts))
+        h["avg_val_score"].append(_PpoLoop._avg_or_nan(vs))
+        h["stable_rank"].append(float("nan") if sr is None else sr)
 
     @staticmethod
     def _postfix(best, rewards, pl, vl, sr, ts, vs):
-        def _avg(lst): return sum(lst) / len(lst) if lst else float("nan")
         p = {"AvgRew": f"{rewards.mean():.3f}", "Best": f"{best:.3f}",
              "PLoss": f"{pl:.3f}", "VLoss": f"{vl:.3f}"}
         if sr is not None:
             p["Rank"] = f"{sr:.2f}"
-        at, av = _avg(ts), _avg(vs)
+        at, av = _PpoLoop._avg_or_nan(ts), _PpoLoop._avg_or_nan(vs)
         if not math.isnan(at):
             p["Train"] = f"{at:.3f}"
         if not math.isnan(av):
@@ -3737,7 +4011,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from model_core.code_alias import load_code_alias_map  # noqa: E402
-from model_core.data.io import read_csv_any_encoding, safe_to_numeric  # noqa: E402
+from model_core.data.io import normalize_code_column, read_csv_any_encoding, safe_to_numeric  # noqa: E402
 
 
 def read_adj_csv(path: Path) -> pd.DataFrame:
@@ -3761,8 +4035,7 @@ def collect_minute_codes(data_root: Path) -> set[str]:
 def normalize_adj(df: pd.DataFrame, old_code: str) -> pd.DataFrame:
     if df.empty:
         return df
-    if "code" not in df.columns and "证券代码" in df.columns:
-        df = df.rename(columns={"证券代码": "code"})
+    df = normalize_code_column(df, fillna_from_alias=False)
     for col in ("date", "adj_factor"):
         if col not in df.columns:
             return pd.DataFrame()
@@ -3911,6 +4184,7 @@ from typing import Iterable
 import pandas as pd
 
 from model_core.data.io import (
+    normalize_code_column,
     read_csv_any_encoding,
     read_last_row_token,
     safe_to_datetime,
@@ -3966,6 +4240,20 @@ def iter_csv_files(root: Path) -> Iterable[Path]:
     return sorted(root.rglob("*.csv"))
 
 
+def _prepare_code_column(
+    df: pd.DataFrame,
+    *,
+    path: Path,
+    tag: str,
+    fillna_from_alias: bool,
+) -> pd.DataFrame | None:
+    df = normalize_code_column(df, fillna_from_alias=fillna_from_alias)
+    if "code" not in df.columns:
+        print(f"[{tag}] missing code column: {path}")
+        return None
+    return df
+
+
 def process_minute_data(minute_root: Path, data_root: Path, dry_run: bool, max_files: int) -> None:
     files = list(iter_csv_files(minute_root))
     if max_files:
@@ -3984,11 +4272,14 @@ def process_minute_data(minute_root: Path, data_root: Path, dry_run: bool, max_f
             dtype={"证券代码": "string", "code": "string", "trade_time": "string"},
             usecols=lambda c: c in {"证券代码", "code", "trade_time", "open", "high", "low", "close", "vol", "amount"},
         )
-        if "code" not in df.columns and "证券代码" not in df.columns:
-            print(f"[minute] missing code column: {path}")
+        df = _prepare_code_column(
+            df,
+            path=path,
+            tag="minute",
+            fillna_from_alias=False,
+        )
+        if df is None:
             continue
-        if "code" not in df.columns:
-            df = df.rename(columns={"证券代码": "code"})
 
         for code, group in df.groupby("code", sort=False):
             output_path = data_root / year / f"{code}.csv"
@@ -4023,14 +4314,14 @@ def process_adj_factors(adj_root: Path, data_root: Path, dry_run: bool, max_file
             dtype={"证券代码": "string", "code": "string", "date": "string"},
             usecols=lambda c: c in {"证券代码", "code", "date", "adj_factor"},
         )
-        if "code" not in df.columns and "证券代码" not in df.columns:
-            print(f"[adj] missing code column: {path}")
+        df = _prepare_code_column(
+            df,
+            path=path,
+            tag="adj",
+            fillna_from_alias=True,
+        )
+        if df is None:
             continue
-        if "code" not in df.columns:
-            df = df.rename(columns={"证券代码": "code"})
-        else:
-            if "证券代码" in df.columns:
-                df["code"] = df["code"].fillna(df["证券代码"])
 
         for code, group in df.groupby("code", sort=False):
             output_path = data_root / "复权因子" / f"{code}.csv"

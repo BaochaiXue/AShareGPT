@@ -223,11 +223,12 @@ class FeatureEngineer:
                 'close': closes[:, i],
                 'volume': volumes[:, i],
             })
-            # Handle zeros in volume to avoid div by zero in some indicators
-            df['volume'] = df['volume'].replace(0, 1e-4)
+            # Keep raw volume for features; use a safe copy for TA indicators.
+            df_safe = df.copy()
+            df_safe['volume'] = df_safe['volume'].replace(0, 1e-4)
             
             # Run Strategy
-            ta_accessor = df.ta
+            ta_accessor = df_safe.ta
             if hasattr(ta_accessor, "cores"):
                 # Avoid multiprocessing path instability across pandas-ta variants.
                 ta_accessor.cores = 0
@@ -249,74 +250,74 @@ class FeatureEngineer:
             feat_dict['WCLOSE'] = (df['high'].values + df['low'].values + 2.0 * df['close'].values) / 4.0
             
             # 3. Returns
-            feat_dict['RET'] = get_col(df, i, ["PCTRET_1"])
-            feat_dict['RET5'] = get_col(df, i, ["PCTRET_5"])
-            feat_dict['RET10'] = get_col(df, i, ["PCTRET_10"])
-            feat_dict['RET20'] = get_col(df, i, ["PCTRET_20"])
-            feat_dict['LOG_RET'] = get_col(df, i, ["LOGRET_1"])
+            feat_dict['RET'] = get_col(df_safe, i, ["PCTRET_1"])
+            feat_dict['RET5'] = get_col(df_safe, i, ["PCTRET_5"])
+            feat_dict['RET10'] = get_col(df_safe, i, ["PCTRET_10"])
+            feat_dict['RET20'] = get_col(df_safe, i, ["PCTRET_20"])
+            feat_dict['LOG_RET'] = get_col(df_safe, i, ["LOGRET_1"])
             
             # 4. Volatility
-            feat_dict['TR'] = get_col(df, i, ["TR", "TRUERANGE"])
-            feat_dict['ATR14'] = get_col(df, i, ["ATR_14", "ATRr_14"])
-            feat_dict['NATR14'] = get_col(df, i, ["NATR_14"])
+            feat_dict['TR'] = get_col(df_safe, i, ["TR", "TRUERANGE"])
+            feat_dict['ATR14'] = get_col(df_safe, i, ["ATR_14", "ATRr_14"])
+            feat_dict['NATR14'] = get_col(df_safe, i, ["NATR_14"])
             
             # 5. Momentum
-            feat_dict['RSI14'] = get_col(df, i, ["RSI_14"])
-            feat_dict['RSI24'] = get_col(df, i, ["RSI_24"])
-            feat_dict['MACD'] = get_col(df, i, ["MACD_12_26_9"])
-            feat_dict['MACDh'] = get_col(df, i, ["MACDh_12_26_9"])
-            feat_dict['MACDs'] = get_col(df, i, ["MACDs_12_26_9"])
-            feat_dict['BOP'] = get_col(df, i, ["BOP"])
-            feat_dict['CCI14'] = get_col(df, i, ["CCI_14_0.015"])
-            feat_dict['CMO14'] = get_col(df, i, ["CMO_14"])
-            feat_dict['KDJ_K'] = get_col(df, i, ["K_9_3"])
-            feat_dict['KDJ_D'] = get_col(df, i, ["D_9_3"])
-            feat_dict['KDJ_J'] = get_col(df, i, ["J_9_3"])
-            feat_dict['MOM10'] = get_col(df, i, ["MOM_10"])
-            feat_dict['ROC10'] = get_col(df, i, ["ROC_10"])
-            feat_dict['PPO'] = get_col(df, i, ["PPO_12_26_9"])
-            feat_dict['PPOh'] = get_col(df, i, ["PPOh_12_26_9"])
-            feat_dict['PPOs'] = get_col(df, i, ["PPOs_12_26_9"])
-            feat_dict['TSI'] = get_col(df, i, ["TSI_13_25_13"])
-            feat_dict['UO'] = get_col(df, i, ["UO_7_14_28"])
-            feat_dict['WILLR'] = get_col(df, i, ["WILLR_14"])
+            feat_dict['RSI14'] = get_col(df_safe, i, ["RSI_14"])
+            feat_dict['RSI24'] = get_col(df_safe, i, ["RSI_24"])
+            feat_dict['MACD'] = get_col(df_safe, i, ["MACD_12_26_9"])
+            feat_dict['MACDh'] = get_col(df_safe, i, ["MACDh_12_26_9"])
+            feat_dict['MACDs'] = get_col(df_safe, i, ["MACDs_12_26_9"])
+            feat_dict['BOP'] = get_col(df_safe, i, ["BOP"])
+            feat_dict['CCI14'] = get_col(df_safe, i, ["CCI_14_0.015"])
+            feat_dict['CMO14'] = get_col(df_safe, i, ["CMO_14"])
+            feat_dict['KDJ_K'] = get_col(df_safe, i, ["K_9_3"])
+            feat_dict['KDJ_D'] = get_col(df_safe, i, ["D_9_3"])
+            feat_dict['KDJ_J'] = get_col(df_safe, i, ["J_9_3"])
+            feat_dict['MOM10'] = get_col(df_safe, i, ["MOM_10"])
+            feat_dict['ROC10'] = get_col(df_safe, i, ["ROC_10"])
+            feat_dict['PPO'] = get_col(df_safe, i, ["PPO_12_26_9"])
+            feat_dict['PPOh'] = get_col(df_safe, i, ["PPOh_12_26_9"])
+            feat_dict['PPOs'] = get_col(df_safe, i, ["PPOs_12_26_9"])
+            feat_dict['TSI'] = get_col(df_safe, i, ["TSI_13_25_13"])
+            feat_dict['UO'] = get_col(df_safe, i, ["UO_7_14_28"])
+            feat_dict['WILLR'] = get_col(df_safe, i, ["WILLR_14"])
             
             # 6. Overlap
-            feat_dict['SMA5'] = get_col(df, i, ["SMA_5"])
-            feat_dict['SMA10'] = get_col(df, i, ["SMA_10"])
-            feat_dict['SMA20'] = get_col(df, i, ["SMA_20"])
-            feat_dict['SMA60'] = get_col(df, i, ["SMA_60"])
-            feat_dict['EMA5'] = get_col(df, i, ["EMA_5"])
-            feat_dict['EMA10'] = get_col(df, i, ["EMA_10"])
-            feat_dict['EMA20'] = get_col(df, i, ["EMA_20"])
-            feat_dict['EMA60'] = get_col(df, i, ["EMA_60"])
-            feat_dict['TEMA10'] = get_col(df, i, ["TEMA_10"])
+            feat_dict['SMA5'] = get_col(df_safe, i, ["SMA_5"])
+            feat_dict['SMA10'] = get_col(df_safe, i, ["SMA_10"])
+            feat_dict['SMA20'] = get_col(df_safe, i, ["SMA_20"])
+            feat_dict['SMA60'] = get_col(df_safe, i, ["SMA_60"])
+            feat_dict['EMA5'] = get_col(df_safe, i, ["EMA_5"])
+            feat_dict['EMA10'] = get_col(df_safe, i, ["EMA_10"])
+            feat_dict['EMA20'] = get_col(df_safe, i, ["EMA_20"])
+            feat_dict['EMA60'] = get_col(df_safe, i, ["EMA_60"])
+            feat_dict['TEMA10'] = get_col(df_safe, i, ["TEMA_10"])
             
             # Strategy requests BBANDS length=20, so map only to 20-bar outputs.
-            feat_dict['BB_UPPER'] = get_col(df, i, ["BBU_20_2.0", "BBU_20_2"])
-            feat_dict['BB_MID'] = get_col(df, i, ["BBM_20_2.0", "BBM_20_2"])
-            feat_dict['BB_LOWER'] = get_col(df, i, ["BBL_20_2.0", "BBL_20_2"])
-            feat_dict['BB_WIDTH'] = get_col(df, i, ["BBB_20_2.0", "BBB_20_2"])
+            feat_dict['BB_UPPER'] = get_col(df_safe, i, ["BBU_20_2.0", "BBU_20_2"])
+            feat_dict['BB_MID'] = get_col(df_safe, i, ["BBM_20_2.0", "BBM_20_2"])
+            feat_dict['BB_LOWER'] = get_col(df_safe, i, ["BBL_20_2.0", "BBL_20_2"])
+            feat_dict['BB_WIDTH'] = get_col(df_safe, i, ["BBB_20_2.0", "BBB_20_2"])
             
-            feat_dict['MIDPOINT'] = get_col(df, i, ["MIDPOINT_2"])
-            feat_dict['MIDPRICE'] = get_col(df, i, ["MIDPRICE_2"])
-            if "PSARl_0.02_0.2" in df.columns and "PSARs_0.02_0.2" in df.columns:
-                sar_series = df["PSARl_0.02_0.2"].combine_first(df["PSARs_0.02_0.2"]).fillna(0.0)
+            feat_dict['MIDPOINT'] = get_col(df_safe, i, ["MIDPOINT_2"])
+            feat_dict['MIDPRICE'] = get_col(df_safe, i, ["MIDPRICE_2"])
+            if "PSARl_0.02_0.2" in df_safe.columns and "PSARs_0.02_0.2" in df_safe.columns:
+                sar_series = df_safe["PSARl_0.02_0.2"].combine_first(df_safe["PSARs_0.02_0.2"]).fillna(0.0)
                 feat_dict['SAR'] = sar_series.values
-            elif "PSARl_0.02_0.2" in df.columns:
-                feat_dict['SAR'] = df["PSARl_0.02_0.2"].fillna(0.0).values
-            elif "PSARs_0.02_0.2" in df.columns:
-                feat_dict['SAR'] = df["PSARs_0.02_0.2"].fillna(0.0).values
+            elif "PSARl_0.02_0.2" in df_safe.columns:
+                feat_dict['SAR'] = df_safe["PSARl_0.02_0.2"].fillna(0.0).values
+            elif "PSARs_0.02_0.2" in df_safe.columns:
+                feat_dict['SAR'] = df_safe["PSARs_0.02_0.2"].fillna(0.0).values
             else:
-                feat_dict['SAR'] = get_col(df, i, ["SAR"])
+                feat_dict['SAR'] = get_col(df_safe, i, ["SAR"])
             
             # 7. Volume
-            feat_dict['OBV'] = get_col(df, i, ["OBV"])
-            feat_dict['AD'] = get_col(df, i, ["AD"])
-            feat_dict['ADOSC'] = get_col(df, i, ["ADOSC_3_10"])
-            feat_dict['CMF'] = get_col(df, i, ["CMF_20"])
-            typ_price = (df["high"] + df["low"] + df["close"]) / 3.0
-            raw_money = typ_price * df["volume"]
+            feat_dict['OBV'] = get_col(df_safe, i, ["OBV"])
+            feat_dict['AD'] = get_col(df_safe, i, ["AD"])
+            feat_dict['ADOSC'] = get_col(df_safe, i, ["ADOSC_3_10"])
+            feat_dict['CMF'] = get_col(df_safe, i, ["CMF_20"])
+            typ_price = (df_safe["high"] + df_safe["low"] + df_safe["close"]) / 3.0
+            raw_money = typ_price * df_safe["volume"]
             price_delta = typ_price.diff()
             pos_mf = raw_money.where(price_delta > 0, 0.0)
             neg_mf = raw_money.where(price_delta < 0, 0.0).abs()

@@ -35,7 +35,7 @@ def _ts_delta(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_zscore(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return torch.zeros_like(x)
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     mean = windows.mean(dim=-1)
@@ -46,7 +46,7 @@ def _ts_zscore(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_decay_linear(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return x
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     w = torch.arange(1, d + 1, device=x.device, dtype=x.dtype)
@@ -57,7 +57,7 @@ def _ts_decay_linear(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_std(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return torch.zeros_like(x)
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     return windows.std(dim=-1, unbiased=False)
@@ -66,7 +66,7 @@ def _ts_std(x: torch.Tensor, d: int) -> torch.Tensor:
 def _ts_rank(x: torch.Tensor, d: int) -> torch.Tensor:
     if d <= 1:
         return torch.zeros_like(x)
-    pad = torch.zeros((x.shape[0], d - 1), device=x.device)
+    pad = torch.zeros((x.shape[0], d - 1), device=x.device, dtype=x.dtype)
     x_pad = torch.cat([pad, x], dim=1)
     windows = x_pad.unfold(1, d, 1)
     last = windows[:, :, -1].unsqueeze(-1)

@@ -43,6 +43,7 @@ def _base_config(monkeypatch) -> None:
     monkeypatch.setattr(ModelConfig, "CN_FEATURE_NORM", "none")
     monkeypatch.setattr(ModelConfig, "CN_STRICT_FEATURE_INDICATORS", True)
     monkeypatch.setattr(ModelConfig, "CN_FEATURE_NEAR_ZERO_STD_TOL", 0.0)
+    monkeypatch.setattr(ModelConfig, "CN_LIMIT_EXEMPT_FILE", "")
     monkeypatch.setattr(ModelConfig, "CN_TRAIN_DAYS", 0)
     monkeypatch.setattr(ModelConfig, "CN_VAL_DAYS", 0)
     monkeypatch.setattr(ModelConfig, "CN_TEST_DAYS", 0)
@@ -366,3 +367,65 @@ def test_loader_t0_whitelist_disables_t_plus_one_block(tmp_path: Path, monkeypat
         torch.tensor([0.0, 1.0], dtype=torch.float32),
     )
     assert torch.all(loader.raw_data_cache["t_plus_one_sell_block"][idx_t0] == 0.0).item()
+
+
+def test_minute_missing_bar_keeps_price_nan_instead_of_ffill(tmp_path: Path, monkeypatch) -> None:
+    _base_config(monkeypatch)
+    monkeypatch.setattr(ModelConfig, "CN_DECISION_FREQ", "1min")
+    monkeypatch.setattr(ModelConfig, "CN_HOLD_BARS", 1)
+    monkeypatch.setattr(ModelConfig, "CN_TRAIN_RATIO", 1.0)
+    monkeypatch.setattr(ModelConfig, "CN_VAL_RATIO", 0.0)
+
+    rows_a = [
+        {"trade_time": "2024-01-02 09:30:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 10.0, "amount": 100.0},
+        {"trade_time": "2024-01-02 09:31:00", "open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0, "vol": 10.0, "amount": 110.0},
+        {"trade_time": "2024-01-02 09:32:00", "open": 12.0, "high": 12.0, "low": 12.0, "close": 12.0, "vol": 10.0, "amount": 120.0},
+    ]
+    rows_b = [
+        {"trade_time": "2024-01-02 09:30:00", "open": 20.0, "high": 20.0, "low": 20.0, "close": 20.0, "vol": 10.0, "amount": 200.0},
+        {"trade_time": "2024-01-02 09:32:00", "open": 22.0, "high": 22.0, "low": 22.0, "close": 22.0, "vol": 10.0, "amount": 220.0},
+    ]
+    _write_minute_csv(tmp_path / "2024" / "000001.csv", rows_a)
+    _write_minute_csv(tmp_path / "2024" / "000002.csv", rows_b)
+
+    loader = ChinaMinuteDataLoader(data_root=str(tmp_path))
+    loader.load_data(codes=["000001", "000002"], years=[2024])
+
+    assert loader.raw_data_cache is not None
+    assert loader.target_ret is not None
+    assert loader.symbols is not None
+
+    idx_b = loader.symbols.index("000002")
+    # 09:31 exists in global timeline but not for 000002: keep NaN (no ffill).
+    assert torch.isnan(loader.raw_data_cache["close"][idx_b, 1]).item()
+    # hold_bars=1 is applied on unified timeline, so 09:32 label is also NaN.
+    assert torch.isnan(loader.target_ret[idx_b, 2]).item()
+
+
+def test_limit_exempt_file_disables_limit_hit_mask(tmp_path: Path, monkeypatch) -> None:
+    _base_config(monkeypatch)
+    monkeypatch.setattr(ModelConfig, "CN_DECISION_FREQ", "daily")
+    monkeypatch.setattr(ModelConfig, "CN_TRAIN_RATIO", 1.0)
+    monkeypatch.setattr(ModelConfig, "CN_VAL_RATIO", 0.0)
+
+    rows = [
+        {"trade_time": "2024-01-02 10:00:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 100.0, "amount": 1000.0},
+        {"trade_time": "2024-01-02 15:00:00", "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "vol": 80.0, "amount": 900.0},
+        {"trade_time": "2024-01-03 10:00:00", "open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0, "vol": 100.0, "amount": 1100.0},
+        {"trade_time": "2024-01-03 15:00:00", "open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0, "vol": 80.0, "amount": 1000.0},
+    ]
+    _write_minute_csv(tmp_path / "2024" / "000001.csv", rows)
+
+    exempt_file = tmp_path / "limit_exempt.csv"
+    pd.DataFrame(
+        [{"code": "000001", "start_date": "2024-01-03", "end_date": "2024-01-03"}]
+    ).to_csv(exempt_file, index=False)
+    monkeypatch.setattr(ModelConfig, "CN_LIMIT_EXEMPT_FILE", str(exempt_file))
+
+    loader = ChinaMinuteDataLoader(data_root=str(tmp_path))
+    loader.load_data(codes=["000001"], years=[2024])
+
+    assert loader.raw_data_cache is not None
+    assert loader.raw_data_cache["limit_up"].shape[1] == 2
+    # Day-2 close is +10% from previous day close; exemption clears limit hit.
+    assert loader.raw_data_cache["limit_up"][0, 1].item() == 0.0

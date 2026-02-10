@@ -27,6 +27,9 @@ class ModelConfig:
     ANNUALIZATION_FACTOR = int(os.getenv("ANNUALIZATION_FACTOR", _DEFAULT_ANN))
     # Price-limit (涨跌停) detection tolerance
     CN_LIMIT_HIT_TOL = float(os.getenv("CN_LIMIT_HIT_TOL", "0.001"))
+    # Optional CSV for listing-day / special limit exemptions:
+    # code,start_date[,end_date]
+    CN_LIMIT_EXEMPT_FILE = os.getenv("CN_LIMIT_EXEMPT_FILE", "")
     STRATEGY_FILE = os.getenv("STRATEGY_FILE", "best_cn_strategy.json")
     CN_MINUTE_DATA_ROOT = os.getenv("CN_MINUTE_DATA_ROOT", "data")
     CN_USE_ADJ_FACTOR = os.getenv("CN_USE_ADJ_FACTOR", "1") == "1"

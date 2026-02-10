@@ -569,7 +569,12 @@ class ChinaMinuteDataLoader:
             if ModelConfig.CN_USE_ADJ_FACTOR:
                 frame = self._apply_adj_factors(code, frame)
             if target_ret_mode == "close_to_close":
-                frame["target_ret"] = (frame["close"] / frame["close"].shift(hold_days)) - 1.0
+                if decision_freq == "1min":
+                    # Compute minute target_ret later on the unified timeline so hold_bars
+                    # is counted in decision bars (including missing minutes), not just raw rows.
+                    frame["target_ret"] = float("nan")
+                else:
+                    frame["target_ret"] = (frame["close"] / frame["close"].shift(hold_days)) - 1.0
             per_code_frames[code] = frame
         return per_code_frames
 
@@ -599,6 +604,9 @@ class ChinaMinuteDataLoader:
         per_code_frames: dict[str, pd.DataFrame],
         *,
         index_col: str = "date",
+        decision_freq: str = "daily",
+        target_ret_mode: str = "close_to_close",
+        hold_period: int = 1,
     ) -> dict[str, pd.DataFrame]:
         def build_pivot(
             field: str,
@@ -620,11 +628,12 @@ class ChinaMinuteDataLoader:
                 pivot = pivot.fillna(fill_value)
             return pivot
 
+        price_ffill = decision_freq != "1min"
         pivot_specs: dict[str, tuple[bool, Optional[float]]] = {
-            "open": (True, None),
-            "high": (True, None),
-            "low": (True, None),
-            "close": (True, None),
+            "open": (price_ffill, None),
+            "high": (price_ffill, None),
+            "low": (price_ffill, None),
+            "close": (price_ffill, None),
             "volume": (False, 0.0),
             "amount": (False, 0.0),
             "target_ret": (False, None),
@@ -636,6 +645,8 @@ class ChinaMinuteDataLoader:
         }
         if ModelConfig.CN_USE_ADJ_FACTOR:
             pivots["adj_factor"] = build_pivot("adj_factor", ffill=True, fill_value=1.0)
+        if decision_freq == "1min" and target_ret_mode == "close_to_close":
+            pivots["target_ret"] = (pivots["close"] / pivots["close"].shift(hold_period)) - 1.0
         return pivots
 
     @staticmethod
@@ -707,11 +718,75 @@ class ChinaMinuteDataLoader:
         close = raw_data_cache["close"]
         prev_day_close = rules.compute_prev_day_close(close, session_ids)
         raw_data_cache["prev_day_close"] = prev_day_close
+        limit_exempt = self._build_limit_exempt_matrix(index=index, symbols=symbols)
+        if limit_exempt is not None:
+            raw_data_cache["limit_exempt"] = limit_exempt
         limit_up, limit_down = rules.build_limit_hit_masks(
-            close=close, prev_day_close=prev_day_close, symbols=symbols,
+            close=close,
+            prev_day_close=prev_day_close,
+            symbols=symbols,
+            limit_exempt=limit_exempt,
         )
         raw_data_cache["limit_up"] = limit_up.float()
         raw_data_cache["limit_down"] = limit_down.float()
+
+    def _build_limit_exempt_matrix(
+        self,
+        *,
+        index: pd.DatetimeIndex,
+        symbols: list[str],
+    ) -> Optional[torch.Tensor]:
+        """Optional runtime limit-exempt mask from external CSV.
+
+        CSV schema:
+            code,start_date[,end_date]
+        """
+
+        cfg_path = (ModelConfig.CN_LIMIT_EXEMPT_FILE or "").strip()
+        if not cfg_path:
+            return None
+
+        path = Path(cfg_path)
+        if not path.is_absolute():
+            path = self.data_root.parent / path
+        if not path.exists():
+            return None
+
+        try:
+            df = read_csv_any_encoding(
+                path,
+                usecols=lambda c: c in {"code", "start_date", "end_date"},
+                dtype=str,
+            )
+        except Exception:
+            return None
+        if df.empty or "code" not in df.columns or "start_date" not in df.columns:
+            return None
+
+        def _norm_code(value: str) -> str:
+            return value.strip().upper().split(".")[0]
+
+        out = torch.zeros((len(symbols), len(index)), dtype=torch.float32, device=ModelConfig.DEVICE)
+        session_dates = pd.DatetimeIndex(index.normalize())
+        code_to_rows: dict[str, pd.DataFrame] = {
+            code: frame for code, frame in df.groupby(df["code"].fillna("").map(_norm_code), sort=False)
+        }
+        for i, symbol in enumerate(symbols):
+            rows = code_to_rows.get(_norm_code(symbol))
+            if rows is None or rows.empty:
+                continue
+            for row in rows.itertuples(index=False):
+                start = pd.to_datetime(getattr(row, "start_date", None), errors="coerce")
+                if pd.isna(start):
+                    continue
+                end_raw = getattr(row, "end_date", None)
+                end = pd.to_datetime(end_raw, errors="coerce")
+                if pd.isna(end):
+                    end = start
+                mask = (session_dates >= start.normalize()) & (session_dates <= end.normalize())
+                if mask.any():
+                    out[i, mask] = 1.0
+        return out
 
     def load_data(
         self,
@@ -756,7 +831,13 @@ class ChinaMinuteDataLoader:
 
         self._apply_recent_day_cutoff(per_code_frames, end_dt=end_dt, decision_freq=decision_freq)
         index_col = "trade_time" if decision_freq == "1min" else "date"
-        pivots = self._build_pivots(per_code_frames, index_col=index_col)
+        pivots = self._build_pivots(
+            per_code_frames,
+            index_col=index_col,
+            decision_freq=decision_freq,
+            target_ret_mode=target_ret_mode,
+            hold_period=hold_period,
+        )
 
         index = pivots["close"].index
         columns = pivots["close"].columns

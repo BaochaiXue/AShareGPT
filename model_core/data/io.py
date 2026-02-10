@@ -7,6 +7,7 @@ from typing import Any, Iterable, Optional
 import pandas as pd
 
 DEFAULT_ENCODINGS: tuple[str, ...] = ("utf-8", "utf-8-sig", "gbk", "gb18030")
+_RETRYABLE_CSV_ERRORS = (UnicodeDecodeError, UnicodeError, pd.errors.ParserError)
 
 
 def read_csv_any_encoding(
@@ -23,7 +24,7 @@ def read_csv_any_encoding(
     for encoding in encodings:
         try:
             return pd.read_csv(path, usecols=usecols, dtype=dtype, encoding=encoding, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - fallback reader intentionally retries broadly
+        except _RETRYABLE_CSV_ERRORS as exc:
             last_err = exc
     if last_err is not None:
         raise last_err
