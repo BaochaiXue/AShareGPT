@@ -145,11 +145,11 @@ class ChinaMinuteDataLoader:
         available.sort()
         return available[-2:] if len(available) >= 2 else available
 
-    def _resolve_codes(self, codes: Optional[list[str]], years: list[int], limit_codes: int) -> list[str]:
+    def _resolve_codes(self, codes: Optional[list[str]], years: list[int], pool_size: int) -> list[str]:
         if codes:
             return codes
         if ModelConfig.CN_CODES:
-            return ModelConfig.CN_CODES[:limit_codes] if limit_codes else ModelConfig.CN_CODES
+            return ModelConfig.CN_CODES[:pool_size] if pool_size else ModelConfig.CN_CODES
         candidates = []
         for year in years:
             year_dir = self.data_root / str(year)
@@ -159,7 +159,7 @@ class ChinaMinuteDataLoader:
             if candidates:
                 break
         candidates = sorted(set(candidates))
-        return candidates[:limit_codes] if limit_codes else candidates
+        return candidates[:pool_size] if pool_size else candidates
 
     def _read_adj_factor_csv(self, path: Path) -> pd.DataFrame:
         return read_csv_any_encoding(
@@ -835,13 +835,13 @@ class ChinaMinuteDataLoader:
         end_date: str = "",
         signal_time: str = "",
         exit_time: str = "",
-        limit_codes: int = 50,
+        pool_size: int = 50,
     ) -> None:
         years = self._resolve_years(years)
         if not years:
             raise ValueError("No available year folders for minute data.")
 
-        codes = self._resolve_codes(codes, years, limit_codes)
+        codes = self._resolve_codes(codes, years, pool_size)
         if not codes:
             raise ValueError("No codes resolved for minute data.")
 

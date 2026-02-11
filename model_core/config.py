@@ -131,7 +131,7 @@ class ModelConfig:
     CN_TARGET_RET_MODE = os.getenv("CN_TARGET_RET_MODE", "close_to_close").strip().lower()
     CN_HOLD_DAYS = int(os.getenv("CN_HOLD_DAYS", "1"))
     CN_HOLD_BARS = int(os.getenv("CN_HOLD_BARS", "1"))
-    CN_MAX_CODES = int(os.getenv("CN_MAX_CODES", "50"))
+    CN_POOL_SIZE = int(os.getenv("CN_POOL_SIZE", "50"))
     CN_MINUTE_DAYS = int(os.getenv("CN_MINUTE_DAYS", "120"))
     CN_TRAIN_RATIO = float(os.getenv("CN_TRAIN_RATIO", "0.7"))
     CN_VAL_RATIO = float(os.getenv("CN_VAL_RATIO", "0.0"))

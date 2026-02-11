@@ -131,7 +131,7 @@ All settings are driven by environment variables (see `.env.example` for the ful
 | `CN_MINUTE_DATA_ROOT` | `data` | Root directory for minute CSVs |
 | `CN_MINUTE_YEARS` | *(auto)* | Comma-separated years to load |
 | `CN_CODES` | *(auto)* | Comma-separated codes; empty = auto-discover |
-| `CN_MAX_CODES` | `50` | Max symbols to load |
+| `CN_POOL_SIZE` | `50` | Max symbols to load |
 | `CN_MINUTE_DAYS` | `120` | Rolling window when no end date set |
 
 ### Decision Frequency & Returns

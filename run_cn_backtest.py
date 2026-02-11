@@ -75,7 +75,7 @@ def run_backtest(
         end_date=ModelConfig.CN_MINUTE_END_DATE,
         signal_time=ModelConfig.CN_SIGNAL_TIME,
         exit_time=ModelConfig.CN_EXIT_TIME,
-        limit_codes=ModelConfig.CN_MAX_CODES,
+        pool_size=ModelConfig.CN_POOL_SIZE,
     )
 
     vm = StackVM()
